@@ -1,0 +1,9 @@
+repos:
+-   repo: local
+    hooks:
+
+    -   id: lint
+        name: normalize code style
+        language: system
+        entry:  bash scripts/lint.sh -c
+        types: [python]
