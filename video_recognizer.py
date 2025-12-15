@@ -76,15 +76,41 @@ def main() -> None:
         default=None,
         help="指定学生姓名（可重复多次），姓名需与图库目录名一致；不指定则统计所有已锁定身份",
     )
+
+    # Model type selection
+    parser.add_argument(
+        "--behavior-model-type",
+        type=str,
+        default="kinetics",
+        choices=["kinetics", "clip"],
+        help="行为识别模型类型: kinetics(Kinetics预训练) 或 clip(零样本自定义)",
+    )
+
+    # Kinetics model options
     parser.add_argument(
         "--behavior-model",
         type=str,
         default="swin3d_t",
         choices=["swin3d_t", "mvit_v1_b", "s3d", "r3d_18"],
-        help="视频动作模型（torchvision 预训练）",
+        help="Kinetics模型选择（仅当model-type=kinetics时）",
     )
-    parser.add_argument("--behavior-clip-seconds", type=float, default=2.0, help="动作模型 clip 时间窗（秒）")
-    parser.add_argument("--behavior-clip-frames", type=int, default=16, help="动作模型采样帧数")
+
+    # CLIP model options
+    parser.add_argument(
+        "--behavior-clip-model",
+        type=str,
+        default="ViT-B/32",
+        choices=["ViT-B/32", "ViT-B/16", "ViT-L/14"],
+        help="CLIP模型选择（仅当model-type=clip时）: ViT-B/32(快), ViT-B/16(平衡), ViT-L/14(准)",
+    )
+    parser.add_argument(
+        "--behavior-clip-subsample",
+        type=int,
+        default=4,
+        help="CLIP模式下每N帧处理一次（1=全部帧，4=每4帧），用于加速",
+    )
+    parser.add_argument("--behavior-clip-seconds", type=float, default=3.0, help="动作模型 clip 时间窗（秒）")
+    parser.add_argument("--behavior-clip-frames", type=int, default=24, help="动作模型采样帧数")
     parser.add_argument(
         "--behavior-person-weights",
         type=str,
@@ -121,7 +147,10 @@ def main() -> None:
             behavior_cfg = BehaviorPipelineConfig(
                 enabled=True,
                 target_names=args.behavior_target,
+                model_type=str(args.behavior_model_type),
                 action_model_name=str(args.behavior_model),
+                clip_model_name=str(args.behavior_clip_model),
+                clip_frame_subsample=int(args.behavior_clip_subsample),
                 device=str(args.device),
                 batch_size_cap=int(args.batch_frames),
                 clip_seconds=float(args.behavior_clip_seconds),

@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import cv2
 
 from src.behavior.action_model import TorchvisionVideoActionModel
+from src.behavior.action_model_clip import CLIPVideoActionModel
 from src.behavior.person_detector import UltralyticsPersonDetector, pick_person_bbox_for_face
 from src.behavior.report import build_behavior_stats
 from src.behavior.stats import BehaviorSeriesConfig
@@ -22,8 +23,17 @@ class BehaviorPipelineConfig:
     enabled: bool = False
     target_names: Optional[List[str]] = None  # if None -> all names
 
-    # Action model
+    # Model selection
+    model_type: str = "kinetics"  # "kinetics" or "clip"
+
+    # Kinetics model config (when model_type="kinetics")
     action_model_name: str = "swin3d_t"
+
+    # CLIP model config (when model_type="clip")
+    clip_model_name: str = "ViT-B/32"  # ViT-B/32, ViT-B/16, ViT-L/14
+    clip_frame_subsample: int = 4  # Process every Nth frame for speed
+    clip_custom_behaviors: Optional[List[str]] = None
+    clip_custom_labels: Optional[List[str]] = None
 
     # Device: reuse top-level --device (auto/cpu/gpu). Internally maps gpu->cuda.
     device: str = "auto"
@@ -140,7 +150,20 @@ def run_behavior_pipeline_on_result(
 
     # Init models.
     dev = _map_device_name(cfg.device)
-    action_model = TorchvisionVideoActionModel(model_name=cfg.action_model_name, device=dev)
+
+    # Select action model based on config
+    if cfg.model_type.lower() == "clip":
+        logger.info(f"Using CLIP zero-shot model: {cfg.clip_model_name}")
+        action_model = CLIPVideoActionModel(
+            model_name=cfg.clip_model_name,
+            device=dev,
+            custom_behaviors=cfg.clip_custom_behaviors,
+            custom_labels=cfg.clip_custom_labels,
+            frame_subsample=cfg.clip_frame_subsample,
+        )
+    else:
+        logger.info(f"Using Kinetics pretrained model: {cfg.action_model_name}")
+        action_model = TorchvisionVideoActionModel(model_name=cfg.action_model_name, device=dev)
 
     try:
         person_detector = UltralyticsPersonDetector(weights_path=cfg.person_detector_weights, device=dev)
