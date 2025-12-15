@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -386,6 +387,11 @@ class VideoFaceRecognizer:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+        # 进度跟踪
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        start_time = time.time()
+        progress_interval = max(100, int(round(fps * 5)))
+
         out = None
         if output_video:
             out = FFmpegPipeWriter(str(output_video), width=width, height=height, fps=fps, codec=ffmpeg_codec)
@@ -396,7 +402,22 @@ class VideoFaceRecognizer:
         occurrences: Dict[str, List[int]] = {}
         frames_info: List[Dict] = []
 
-        batch_frames = max(1, int(batch_frames))
+        batch_frames_cap = max(1, int(batch_frames))
+        is_gpu = bool(getattr(self.recognizer, "ctx_id", -1) >= 0)
+        # 将 --batch-frames 视为“帧批上限”；实际 batch 会按机器/场景自适应。
+        eff_batch_frames = min(batch_frames_cap, 16 if is_gpu else 8)
+        eff_batch_frames = max(1, int(eff_batch_frames))
+
+        try:
+            logger.info(
+                f"批大小上限={batch_frames_cap}，实际批大小={eff_batch_frames}（device={'gpu' if is_gpu else 'cpu'}；运行中自适应）"
+            )
+        except Exception:
+            pass
+
+        batch_time_per_sample_ema: Optional[float] = None
+        batch_adjust_every = 4
+        batch_counter = 0
         frame_buffer: Dict[int, np.ndarray] = {}
         pending_sample_indices: List[int] = []
         write_pos = 0
@@ -422,14 +443,16 @@ class VideoFaceRecognizer:
             if frame_idx % frame_interval == 0:
                 pending_sample_indices.append(frame_idx)
 
-            while len(pending_sample_indices) >= batch_frames:
-                current_batch_indices = pending_sample_indices[:batch_frames]
+            while len(pending_sample_indices) >= eff_batch_frames:
+                current_batch_indices = pending_sample_indices[:eff_batch_frames]
                 batch_images = [frame_buffer[idx] for idx in current_batch_indices if idx in frame_buffer]
                 if not batch_images:
-                    pending_sample_indices = pending_sample_indices[batch_frames:]
+                    pending_sample_indices = pending_sample_indices[eff_batch_frames:]
                     break
 
+                t0 = time.time()
                 faces_batch = self.recognizer.detect_faces_batch(batch_images)
+                dt = max(1e-6, time.time() - t0)
                 for local_i, global_idx in enumerate(current_batch_indices):
                     if global_idx not in frame_buffer:
                         continue
@@ -470,10 +493,46 @@ class VideoFaceRecognizer:
 
                     frames_info.append(self._build_frame_record(global_idx, fps, detections))
 
-                pending_sample_indices = pending_sample_indices[batch_frames:]
+                pending_sample_indices = pending_sample_indices[eff_batch_frames:]
+
+                # 自适应调整实际 batch：在同一机器上趋于稳定；场景人脸多/推理变慢时自动收敛。
+                try:
+                    batch_counter += 1
+                    per_sample = float(dt) / max(1.0, float(len(current_batch_indices)))
+                    if batch_time_per_sample_ema is None:
+                        batch_time_per_sample_ema = per_sample
+                    else:
+                        batch_time_per_sample_ema = 0.85 * float(batch_time_per_sample_ema) + 0.15 * per_sample
+
+                    if batch_counter % int(batch_adjust_every) == 0 and batch_time_per_sample_ema is not None:
+                        ema = float(batch_time_per_sample_ema)
+                        if per_sample > ema * 1.35 and eff_batch_frames > 1:
+                            eff_batch_frames = max(1, eff_batch_frames // 2)
+                        elif per_sample < ema * 0.75 and eff_batch_frames < batch_frames_cap:
+                            eff_batch_frames = min(batch_frames_cap, max(eff_batch_frames + 1, eff_batch_frames * 2))
+                except Exception:
+                    pass
 
             flush_frames_up_to()
             frame_idx += 1
+
+            # 周期性输出处理进度（避免过于频繁）
+            try:
+                if frame_idx % progress_interval == 0:
+                    elapsed = max(1e-6, time.time() - start_time)
+                    rate = frame_idx / elapsed
+                    if total_frames > 0 and rate > 0:
+                        pct = frame_idx * 100.0 / total_frames
+                        eta_sec = (total_frames - frame_idx) / rate
+                        logger.info(
+                            f"进度: {frame_idx}/{total_frames} 帧 ({pct:.1f}%), 速率: {rate:.1f} fps, ETA: {eta_sec:.1f}s, 待处理抽帧={len(pending_sample_indices)}, 实际批大小={eff_batch_frames}/{batch_frames_cap}"
+                        )
+                    else:
+                        logger.info(
+                            f"进度: {frame_idx} 帧, 速率: {rate:.1f} fps, 待处理抽帧={len(pending_sample_indices)}, 实际批大小={eff_batch_frames}/{batch_frames_cap}"
+                        )
+            except Exception:
+                pass
 
         if pending_sample_indices:
             batch_images = [frame_buffer[idx] for idx in pending_sample_indices if idx in frame_buffer]
@@ -529,6 +588,13 @@ class VideoFaceRecognizer:
         if out is not None:
             out.close()
 
+        # 最终进度汇总
+        try:
+            total_elapsed = time.time() - start_time
+            logger.info(f"处理完成（简单模式）耗时: {total_elapsed:.1f}s, 处理帧数: {frame_idx}")
+        except Exception:
+            pass
+
         result = self._build_header_meta(
             input_video,
             output_video if output_video else None,
@@ -572,6 +638,7 @@ class VideoFaceRecognizer:
         ffmpeg_codec: Optional[str] = None,
         max_frames: int = None,
         max_seconds: float = None,
+        behavior_config: Optional[object] = None,
     ) -> Dict:
         tracker = SimpleTracker(iou_threshold=iou_threshold, max_lost=max_lost)
         person_map: Dict[str, int] = {}
@@ -591,13 +658,43 @@ class VideoFaceRecognizer:
 
         frame_interval = self._compute_frame_interval(fps, frame_interval_sec, frame_interval_frames)
 
+        # 进度跟踪
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        start_time = time.time()
+        progress_interval = max(100, int(round(fps * 5)))
+
         frame_idx = 0
         frames_info: List[Dict] = []
 
         max_frames_i = int(max_frames) if max_frames is not None else None
         max_seconds_f = float(max_seconds) if max_seconds is not None else None
 
-        batch_frames = max(1, int(batch_frames))
+        batch_frames_cap = max(1, int(batch_frames))
+        is_gpu = bool(getattr(self.recognizer, "ctx_id", -1) >= 0)
+        eff_batch_frames = min(batch_frames_cap, 16 if is_gpu else 8)
+        eff_batch_frames = max(1, int(eff_batch_frames))
+
+        try:
+            logger.info(
+                f"批大小上限={batch_frames_cap}，实际批大小={eff_batch_frames}（device={'gpu' if is_gpu else 'cpu'}；运行中自适应）"
+            )
+        except Exception:
+            pass
+
+        batch_time_per_sample_ema: Optional[float] = None
+        batch_adjust_every = 4
+        batch_counter = 0
+        merge_counter = 0
+
+        def _merge_interval(track_count: int) -> int:
+            # 轨迹越多，merge_similar_tracks 的 O(n^2) 越贵，因此降低频率。
+            if track_count < 20:
+                return 1
+            if track_count < 40:
+                return 4
+            if track_count < 80:
+                return 8
+            return 12
 
         frame_buffer: Dict[int, np.ndarray] = {}
         pending_sample_indices: List[int] = []
@@ -634,14 +731,16 @@ class VideoFaceRecognizer:
             if frame_idx % frame_interval == 0:
                 pending_sample_indices.append(frame_idx)
 
-            while len(pending_sample_indices) >= batch_frames:
-                current_batch_indices = pending_sample_indices[:batch_frames]
+            while len(pending_sample_indices) >= eff_batch_frames:
+                current_batch_indices = pending_sample_indices[:eff_batch_frames]
                 batch_images = [frame_buffer[idx] for idx in current_batch_indices if idx in frame_buffer]
                 if not batch_images:
-                    pending_sample_indices = pending_sample_indices[batch_frames:]
+                    pending_sample_indices = pending_sample_indices[eff_batch_frames:]
                     break
 
+                t0 = time.time()
                 faces_batch = self.recognizer.detect_faces_batch(batch_images)
+                dt = max(1e-6, time.time() - t0)
                 for local_i, global_idx in enumerate(current_batch_indices):
                     if global_idx not in frame_buffer:
                         continue
@@ -702,15 +801,57 @@ class VideoFaceRecognizer:
                         export_dets.append(ser)
                     frames_info.append(self._build_frame_record(global_idx, fps, export_dets))
 
+                # 轨迹合并：按轨迹数量自适应降低频率
                 try:
-                    tracker.merge_similar_tracks(threshold=merge_similarity_threshold)
+                    merge_counter += 1
+                    interval = _merge_interval(len(tracker.tracks) if tracker is not None else 0)
+                    if interval > 0 and (merge_counter % int(interval) == 0):
+                        tracker.merge_similar_tracks(threshold=merge_similarity_threshold)
                 except Exception:
                     logger.debug("合并相似轨迹失败", exc_info=True)
 
-                pending_sample_indices = pending_sample_indices[batch_frames:]
+                pending_sample_indices = pending_sample_indices[eff_batch_frames:]
+
+                # 自适应调整实际 batch
+                try:
+                    batch_counter += 1
+                    per_sample = float(dt) / max(1.0, float(len(current_batch_indices)))
+                    if batch_time_per_sample_ema is None:
+                        batch_time_per_sample_ema = per_sample
+                    else:
+                        batch_time_per_sample_ema = 0.85 * float(batch_time_per_sample_ema) + 0.15 * per_sample
+
+                    if batch_counter % int(batch_adjust_every) == 0 and batch_time_per_sample_ema is not None:
+                        ema = float(batch_time_per_sample_ema)
+                        if per_sample > ema * 1.35 and eff_batch_frames > 1:
+                            eff_batch_frames = max(1, eff_batch_frames // 2)
+                        elif per_sample < ema * 0.75 and eff_batch_frames < batch_frames_cap:
+                            eff_batch_frames = min(batch_frames_cap, max(eff_batch_frames + 1, eff_batch_frames * 2))
+                except Exception:
+                    pass
 
             flush_frames_up_to()
             frame_idx += 1
+
+            # 周期性输出处理进度（包含轨迹信息）
+            try:
+                if frame_idx % progress_interval == 0:
+                    elapsed = max(1e-6, time.time() - start_time)
+                    rate = frame_idx / elapsed
+                    track_count = len(tracker.tracks) if tracker is not None else 0
+                    exported = len(frames_info)
+                    if total_frames > 0 and rate > 0:
+                        pct = frame_idx * 100.0 / total_frames
+                        eta_sec = (total_frames - frame_idx) / rate
+                        logger.info(
+                            f"进度: {frame_idx}/{total_frames} 帧 ({pct:.1f}%), 速率: {rate:.1f} fps, ETA: {eta_sec:.1f}s, 活跃轨迹={track_count}, 导出帧={exported}, 待处理抽帧={len(pending_sample_indices)}, 实际批大小={eff_batch_frames}/{batch_frames_cap}"
+                        )
+                    else:
+                        logger.info(
+                            f"进度: {frame_idx} 帧, 速率: {rate:.1f} fps, 活跃轨迹={track_count}, 导出帧={exported}, 待处理抽帧={len(pending_sample_indices)}, 实际批大小={eff_batch_frames}/{batch_frames_cap}"
+                        )
+            except Exception:
+                pass
 
         if pending_sample_indices:
             batch_images = [frame_buffer[idx] for idx in pending_sample_indices if idx in frame_buffer]
@@ -886,6 +1027,20 @@ class VideoFaceRecognizer:
         result["occurrences"] = {k: [int(v) for v in vs] for k, vs in occurrences.items()}
         result["frames"] = frames_info
         result["tracklets"] = tracklets_out
+
+        if behavior_config is not None and getattr(behavior_config, "enabled", False):
+            try:
+                from src.behavior.pipeline import run_behavior_pipeline_on_result
+
+                behavior_stats = run_behavior_pipeline_on_result(
+                    input_video=str(input_video),
+                    result=result,
+                    cfg=behavior_config,  # type: ignore[arg-type]
+                )
+                if behavior_stats is not None:
+                    result["behavior_stats"] = behavior_stats
+            except Exception:
+                logger.warning("behavior 已启用但统计生成失败（已忽略）", exc_info=True)
 
         Path(output_json).parent.mkdir(parents=True, exist_ok=True)
         with open(output_json, "w", encoding="utf-8") as f:

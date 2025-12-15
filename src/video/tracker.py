@@ -316,19 +316,22 @@ class SimpleTracker:
         emb_map = {}
         for tid in tids:
             info = self.tracks.get(tid)
-            try:
-                agg = info["tracklet"].aggregate()
-            except Exception:
-                agg = None
-            if agg is not None:
-                emb_map[tid] = np.array(agg, dtype=float)
-
-        def cos_sim(a, b):
-            na = np.linalg.norm(a)
-            nb = np.linalg.norm(b)
-            if na == 0 or nb == 0:
-                return 0.0
-            return float(np.dot(a, b) / (na * nb))
+            if not info:
+                continue
+            t = info.get("tracklet")
+            if t is None:
+                continue
+            # 关键优化：使用在线聚合 embedding，避免每次 merge 都对全历史 embeddings 做 np.stack。
+            agg = getattr(t, "agg_embedding", None)
+            if agg is None:
+                try:
+                    if getattr(t, "embeddings", None):
+                        agg = np.asarray(t.embeddings[-1], dtype=np.float32).reshape(-1)
+                except Exception:
+                    agg = None
+            if agg is None:
+                continue
+            emb_map[tid] = np.asarray(agg, dtype=np.float32).reshape(-1)
 
         merged = set()
         for i in range(len(tids)):
@@ -343,11 +346,19 @@ class SimpleTracker:
                 pb = self.tracks[b].get("person_id")
                 if pa is not None and pb is not None and pa != pb:
                     continue
+                # 若两条轨迹都已显示为“已知”且不同姓名，直接跳过（减少无意义比较）
+                try:
+                    da = self.tracks[a].get("display_identity")
+                    db = self.tracks[b].get("display_identity")
+                    if da and db and da != "未知" and db != "未知" and da != db:
+                        continue
+                except Exception:
+                    pass
                 ea = emb_map.get(a)
                 eb = emb_map.get(b)
                 if ea is None or eb is None:
                     continue
-                sim = cos_sim(ea, eb)
+                sim = _cos_sim(ea, eb)
                 if sim >= threshold:
                     last_seen_a = int(self.tracks[a].get("last_seen", -1))
                     last_seen_b = int(self.tracks[b].get("last_seen", -1))
@@ -367,6 +378,28 @@ class SimpleTracker:
                     kt.qualities.extend(rt.qualities)
                     kt.identities.extend(rt.identities)
                     kt.similarities.extend(rt.similarities)
+
+                    # 合并在线聚合 embedding 状态（用于后续 update/merge 更快）
+                    try:
+                        ka = getattr(kt, "agg_embedding", None)
+                        ra = getattr(rt, "agg_embedding", None)
+                        kw = float(getattr(kt, "agg_weight", 0.0) or 0.0)
+                        rw = float(getattr(rt, "agg_weight", 0.0) or 0.0)
+                        if ka is None and ra is not None:
+                            kt.agg_embedding = np.asarray(ra, dtype=np.float32).reshape(-1)
+                            kt.agg_weight = max(0.0, rw)
+                        elif ka is not None and ra is not None:
+                            ka2 = np.asarray(ka, dtype=np.float32).reshape(-1)
+                            ra2 = np.asarray(ra, dtype=np.float32).reshape(-1)
+                            denom = max(1e-6, kw + rw)
+                            merged_emb = (ka2 * kw + ra2 * rw) / denom
+                            n2 = float(np.linalg.norm(merged_emb))
+                            if n2 > 1e-12:
+                                merged_emb = merged_emb / n2
+                            kt.agg_embedding = merged_emb
+                            kt.agg_weight = float(kw + rw)
+                    except Exception:
+                        pass
                     kinfo["last_bbox"] = rinfo.get("last_bbox") or kinfo.get("last_bbox")
                     kinfo["last_seen"] = max(int(kinfo.get("last_seen", -1)), int(rinfo.get("last_seen", -1)))
                     if rinfo.get("person_id") is not None:

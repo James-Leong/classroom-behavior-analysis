@@ -120,6 +120,12 @@ class FaceRecognizer:
         # 运行参数
         self.ctx_id = -1  # -1表示CPU，0表示第一个GPU
 
+        # 内部自适应批处理：限制一次性送入 recognition.get_feat 的人脸数量，
+        # 避免 CPU/内存带宽场景下“大 batch 反而更慢”。
+        # 该值会在运行时根据耗时自适应调整；不暴露 CLI 参数。
+        self._feat_chunk_size: Optional[int] = None
+        self._feat_chunk_cap: int = 256
+
         # 初始化模型
         self._initialize_models()
         self._load_or_build_gallery()
@@ -411,18 +417,62 @@ class FaceRecognizer:
                 except Exception:
                     continue
 
-        # 批量提特征
+        # 批量提特征（内部 micro-batch + 自适应 chunk size）
         if aligned:
             try:
-                feats = rec_model.get_feat(aligned)
-                feats = np.asarray(feats)
+                is_gpu = bool(getattr(self, "ctx_id", -1) >= 0)
+
+                # 初始化 chunk size（按设备给一个稳健的起点）
+                if self._feat_chunk_size is None:
+                    self._feat_chunk_size = 256 if is_gpu else 32
+
+                # 设备上限：GPU 允许更大；CPU 保守一些
+                cap = int(self._feat_chunk_cap)
+                if not is_gpu:
+                    cap = min(cap, 64)
+
+                chunk = int(max(1, min(int(self._feat_chunk_size), cap)))
+
+                feats_out: List[np.ndarray] = []
+                t_chunk_ema: Optional[float] = None
+
+                # 分块执行 get_feat；同时根据 chunk 耗时自适应调整 chunk 大小
+                offset = 0
+                while offset < len(aligned):
+                    sub = aligned[offset : offset + chunk]
+                    t0 = time.time()
+                    sub_feats = rec_model.get_feat(sub)
+                    dt = max(1e-6, time.time() - t0)
+                    feats_out.append(np.asarray(sub_feats))
+
+                    # 更新 EMA（按 chunk 总耗时，而不是单脸耗时，避免噪声）
+                    if t_chunk_ema is None:
+                        t_chunk_ema = dt
+                    else:
+                        t_chunk_ema = 0.85 * float(t_chunk_ema) + 0.15 * float(dt)
+
+                    # 自适应：chunk 太慢就缩小，太快就增大（但不超过 cap）
+                    # CPU 的目标更保守，GPU 更激进。
+                    slow_th = 0.60 if not is_gpu else 0.25
+                    fast_th = 0.18 if not is_gpu else 0.10
+                    if float(dt) > slow_th and chunk > 1:
+                        chunk = max(1, chunk // 2)
+                    elif float(dt) < fast_th and chunk < cap:
+                        chunk = min(cap, max(chunk + 1, chunk * 2))
+
+                    offset += len(sub)
+
+                feats = np.concatenate(feats_out, axis=0) if len(feats_out) > 1 else feats_out[0]
                 for j, (img_idx, face_idx) in enumerate(face_ptrs):
                     try:
-                        faces_batch[img_idx][face_idx].embedding = feats[j].flatten()
+                        faces_batch[img_idx][face_idx].embedding = np.asarray(feats[j]).flatten()
                     except Exception:
                         pass
+
+                # 保存下一次调用的建议 chunk size（使得在同一机器上趋于稳定）
+                self._feat_chunk_size = int(max(1, min(chunk, cap)))
             except Exception:
-                # 回退：逐脸 get
+                # 回退：逐脸 get（保证正确性优先）
                 for img_idx, img in enumerate(images):
                     for f in faces_batch[img_idx]:
                         try:

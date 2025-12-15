@@ -8,6 +8,9 @@ from __future__ import annotations
 import argparse
 import time
 
+from src.behavior.pipeline import BehaviorPipelineConfig
+from src.behavior.stats import BehaviorSeriesConfig
+
 from src.utils.log import get_logger
 from src.video.recognizer import SCHEMA_VERSION, VideoFaceRecognizer
 
@@ -39,22 +42,20 @@ def main() -> None:
     parser.add_argument("--interval", "-i", type=float, help="抽帧间隔（秒），默认 2.0", default=2.0)
     parser.add_argument("--interval-frames", "-f", type=int, help="抽帧间隔（帧数），如果指定则优先使用", default=None)
     parser.add_argument(
-        "--mode", "-m", choices=["simple", "tracklet"], default="simple", help="识别模式：simple 或 tracklet"
+        "--mode", "-m", choices=["simple", "tracklet"], default="tracklet", help="识别模式：simple 或 tracklet"
     )
-    parser.add_argument("--batch-frames", type=int, default=8, help="批量处理的帧数，>1 时启用多帧批识别")
+    parser.add_argument("--batch-frames", type=int, default=32, help="批量处理的帧数，>1 时启用多帧批识别")
     parser.add_argument("--iou-threshold", type=float, default=0.3, help="轨迹模式 IoU 阈值")
     parser.add_argument("--max-lost", type=int, default=8, help="轨迹模式允许的最大丢失帧数")
     parser.add_argument("--merge-sim-threshold", type=float, default=0.86, help="轨迹合并相似度阈值")
     parser.add_argument("--debug-identify", action="store_true", help="在识别时输出 top-k 相似度用于调试")
-    parser.add_argument(
-        "--recognition-threshold", type=float, default=None, help="覆盖识别器的单帧相似度阈值（推荐 0.2）"
-    )
+    parser.add_argument("--recognition-threshold", "-t", type=float, default=0.3, help="覆盖识别器的单帧相似度阈值")
     parser.add_argument("--tracklet-min-votes", type=int, default=2, help="轨迹内最小票数阈值")
     parser.add_argument("--max-frames", type=int, default=None, help="最多处理多少帧（用于快速调试/测试）")
     parser.add_argument("--max-seconds", type=float, default=None, help="最多处理多少秒（用于快速调试/测试）")
-    parser.add_argument("--lock-threshold", type=float, default=0.46, help="轨迹锁定阈值（display_identity）")
+    parser.add_argument("--lock-threshold", type=float, default=0.35, help="轨迹锁定阈值（display_identity）")
     parser.add_argument("--lock-min-frames", type=int, default=2, help="锁定所需连续帧数")
-    parser.add_argument("--switch-threshold", type=float, default=0.54, help="切换锁定身份阈值")
+    parser.add_argument("--switch-threshold", type=float, default=0.5, help="切换锁定身份阈值")
     parser.add_argument("--switch-min-frames", type=int, default=2, help="切换所需连续帧数")
     parser.add_argument("--unlock-threshold", type=float, default=0.35, help="解锁阈值（unknown 且低相似度时）")
     parser.add_argument("--unlock-grace-frames", type=int, default=3, help="解锁需要累计帧数（避免抖动）")
@@ -66,6 +67,35 @@ def main() -> None:
         choices=["libx264", "h264_nvenc", "mpeg4"],
         help="指定 ffmpeg 编码器（默认自动优先 h264_nvenc，其次 libx264，最后 mpeg4）",
     )
+
+    # Behavior analysis (video action model)
+    parser.add_argument("--behavior", action="store_true", help="启用视频行为识别并输出 behavior_stats")
+    parser.add_argument(
+        "--behavior-target",
+        action="append",
+        default=None,
+        help="指定学生姓名（可重复多次），姓名需与图库目录名一致；不指定则统计所有已锁定身份",
+    )
+    parser.add_argument(
+        "--behavior-model",
+        type=str,
+        default="swin3d_t",
+        choices=["swin3d_t", "mvit_v1_b", "s3d", "r3d_18"],
+        help="视频动作模型（torchvision 预训练）",
+    )
+    parser.add_argument("--behavior-clip-seconds", type=float, default=2.0, help="动作模型 clip 时间窗（秒）")
+    parser.add_argument("--behavior-clip-frames", type=int, default=16, help="动作模型采样帧数")
+    parser.add_argument(
+        "--behavior-person-weights",
+        type=str,
+        default="yolo11n.pt",
+        help="person 检测权重路径（Ultralytics YOLO）",
+    )
+    parser.add_argument("--behavior-person-conf", type=float, default=0.25, help="person 检测置信度阈值")
+    parser.add_argument("--behavior-th-on", type=float, default=0.60, help="行为进入阈值")
+    parser.add_argument("--behavior-th-off", type=float, default=0.45, help="行为退出阈值")
+    parser.add_argument("--behavior-min-seconds", type=float, default=0.50, help="最短行为持续时间（秒）")
+    parser.add_argument("--behavior-merge-gap", type=float, default=0.30, help="同类行为段合并间隙（秒）")
 
     args = parser.parse_args()
 
@@ -86,6 +116,23 @@ def main() -> None:
             logger.warning("设置 recognition_threshold 失败，忽略")
 
     if args.mode == "tracklet":
+        behavior_cfg = None
+        if bool(args.behavior):
+            behavior_cfg = BehaviorPipelineConfig(
+                enabled=True,
+                target_names=args.behavior_target,
+                action_model_name=str(args.behavior_model),
+                clip_seconds=float(args.behavior_clip_seconds),
+                clip_num_frames=int(args.behavior_clip_frames),
+                person_detector_weights=str(args.behavior_person_weights),
+                person_conf=float(args.behavior_person_conf),
+                series_cfg=BehaviorSeriesConfig(
+                    th_on=float(args.behavior_th_on),
+                    th_off=float(args.behavior_th_off),
+                    min_duration_seconds=float(args.behavior_min_seconds),
+                    merge_gap_seconds=float(args.behavior_merge_gap),
+                ),
+            )
         vfr.process_with_tracklets(
             args.input,
             args.output_video,
@@ -107,6 +154,7 @@ def main() -> None:
             unlock_grace_frames=args.unlock_grace_frames,
             hold_unknown_frames=args.hold_unknown_frames,
             ffmpeg_codec=args.ffmpeg_codec,
+            behavior_config=behavior_cfg,
         )
     else:
         vfr.process(
