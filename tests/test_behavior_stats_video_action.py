@@ -33,7 +33,15 @@ class _DummyActionModel:
         scores = {c: 0.01 for c in self.categories}
         scores["writing"] = 0.95
         top = [("writing", 0.95)]
-        return scores, type("Top", (), {"categories": top})
+
+        def _top_obj():
+            return type("Top", (), {"categories": top})
+
+        if isinstance(clip_rgb_uint8, (list, tuple)):
+            n = len(list(clip_rgb_uint8))
+            return [dict(scores) for _ in range(n)], [_top_obj() for _ in range(n)]
+
+        return scores, _top_obj()
 
 
 class _DummyPersonDetector:

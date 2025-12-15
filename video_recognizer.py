@@ -122,6 +122,8 @@ def main() -> None:
                 enabled=True,
                 target_names=args.behavior_target,
                 action_model_name=str(args.behavior_model),
+                device=str(args.device),
+                batch_size_cap=int(args.batch_frames),
                 clip_seconds=float(args.behavior_clip_seconds),
                 clip_num_frames=int(args.behavior_clip_frames),
                 person_detector_weights=str(args.behavior_person_weights),

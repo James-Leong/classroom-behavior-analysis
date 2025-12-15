@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import List
 
 import cv2
 import numpy as np
@@ -79,21 +79,40 @@ def sample_frame_indices(center_frame: int, fps: float, window_seconds: float, n
 
 
 def read_frames_by_index(cap: cv2.VideoCapture, frame_indices: List[int]) -> List[np.ndarray]:
+    """Read frames by indices, optimized for sequential access.
+
+    If indices are mostly sequential, this avoids repeated seeks.
+    """
     frames: List[np.ndarray] = []
-    last_pos = -1
-    for fi in frame_indices:
-        if fi != last_pos:
+    if not frame_indices:
+        return frames
+
+    indices = list(frame_indices)
+    # Seek to first frame once
+    cap.set(cv2.CAP_PROP_POS_FRAMES, float(indices[0]))
+    current_pos = int(indices[0])
+
+    for fi in indices:
+        # If we need to skip backwards or jump forward, seek
+        if fi < current_pos or fi > current_pos + 1:
             cap.set(cv2.CAP_PROP_POS_FRAMES, float(fi))
+            current_pos = fi
+        # If fi == current_pos+1, we can just read (sequential)
+        # If fi == current_pos, we need to seek back
+        elif fi < current_pos:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, float(fi))
+            current_pos = fi
+
         ok, frame = cap.read()
         if not ok or frame is None:
             # Pad with last available frame if possible
             if frames:
                 frames.append(frames[-1].copy())
-                last_pos = fi
                 continue
             raise RuntimeError(f"failed to read frame {fi}")
         frames.append(frame)
-        last_pos = fi + 1
+        current_pos = fi + 1
+
     return frames
 
 

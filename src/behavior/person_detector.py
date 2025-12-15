@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 
@@ -25,6 +25,8 @@ class UltralyticsPersonDetector:
         self.model = YOLO(str(weights_path))
         dev = str(device).lower().strip()
         if dev == "auto":
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif dev in {"gpu", "cuda"}:
             self.device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
             self.device = str(device)
@@ -83,7 +85,8 @@ def pick_person_bbox_for_face(
     for p in persons:
         px1, py1, px2, py2 = [float(x) for x in p.bbox]
         # Prefer reasonable horizontal overlap (avoid matching to far-away person).
-        if cx < px1 - 0.25 * (px2 - px1) or cx > px2 + 0.25 * (px2 - px1):
+        # Relaxed from 0.25 to 0.5 to improve recall.
+        if cx < px1 - 0.5 * (px2 - px1) or cx > px2 + 0.5 * (px2 - px1):
             continue
         d2 = _point_rect_dist2(px1, py1, px2, py2)
         area = max(1.0, (px2 - px1) * (py2 - py1))
@@ -96,9 +99,10 @@ def pick_person_bbox_for_face(
         return None
 
     # Reject if too far from the chosen bbox (normalized by bbox size).
+    # Relaxed from 0.18 to 0.35 to improve recall for classroom scenarios.
     px1, py1, px2, py2 = [float(x) for x in best_bbox]
     diag2 = max(1.0, (px2 - px1) ** 2 + (py2 - py1) ** 2)
-    if float(best_d2) / diag2 > 0.18:
+    if float(best_d2) / diag2 > 0.35:
         return None
 
     return best_bbox
