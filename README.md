@@ -1,4 +1,4 @@
-# 课堂行为分析系统 v2
+# 课堂行为分析系统
 
 智能课堂行为分析系统，支持视频人脸识别、学生轨迹跟踪、行为识别与统计分析。
 
@@ -12,25 +12,31 @@
 
 ## 🚀 快速开始
 
-### 安装依赖
+### 环境安装
+
+本项目推荐使用 `uv` 管理 Python 环境（可选），也可以直接使用系统 Python + `pip`。
+
+使用 `uv`（推荐）：
+
+```bash
+apt-get install pipx
+pipx ensurepath
+pipx install uv
+
+# 安装项目依赖（默认）
+uv sync
+
+# 如果希望安装开发组依赖：
+uv sync --group dev
+```
+
+如果不使用 `uv`，可直接安装依赖：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 使用脚本一键运行
-
-```bash
-# 分析所有学生
-./scripts/run_analysis.sh classroom_video.mp4
-
-# 指定特定学生
-./scripts/run_analysis.sh classroom_video.mp4 --target 张三 --target 李四
-```
-
-### 手动两阶段流程
-
-#### 阶段一：人脸识别
+### 人脸识别
 
 ```bash
 python video_recognizer.py data/video/20251115_clip.mp4 \
@@ -43,7 +49,7 @@ python video_recognizer.py data/video/20251115_clip.mp4 \
 
 **输出**：包含人脸和body bbox的JSON文件
 
-#### 阶段二：行为识别
+### 行为识别
 
 ```bash
 python behavior_analyzer.py \
@@ -57,28 +63,41 @@ python behavior_analyzer.py \
 
 ## 📚 文档
 
-- [v2重构详细说明](docs/REFACTOR_V2.md) - 架构设计、技术细节、使用指南
-- [更新日志](CHANGELOG.md) - 版本变更记录
+- []() -
+
+## 模型下载
+
+### 图像检测模型
+`yolo11n` 检测模型（`yolo11n.pt`）会在模块首次运行时自动下载到当前工作目录下。若下载速度过慢，请设置代理或手动下载：
+
+```bash
+export HTTP_PROXY="xxx"
+export HTTPS_PROXY="xxx"
+```
+
+### 人脸识别模型
+项目使用 `insightface` 的 `buffalo_l` 模型，会在首次运行时自动下载到 `~/.insightface/model`。若下载缓慢，可手动下载并解压到该目录：
+
+```bash
+# 使用镜像源下载
+wget "https://gh-proxy.org/https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
+mv buffalo_l.zip ~/.insightface/model/
+cd ~/.insightface/model/
+unzip buffalo_l.zip -d buffalo_l
+rm buffalo_l.zip
+```
+
+## 中文字体异常
+
+在部分 Ubuntu 系统中可能缺失中文字体，导致可视化图片中的中文标签乱码。可安装常用中文字体包以解决：
+
+```bash
+sudo apt update
+sudo apt install -y fonts-noto-cjk fonts-wqy-zenhei fonts-wqy-microhei fonts-arphic-ukai fonts-arphic-uming
+```
 
 ## 🏗️ 架构概览
 
-### v2 重构核心改进
-
-1. **解耦设计**
-   - 人脸识别 → JSON → 行为识别
-   - 可多次运行行为识别，无需重复人脸识别
-
-2. **轨迹身份回溯**
-   - 锁定后回溯到首次出现帧
-   - 基于embedding距离检测身份切换
-
-3. **Body bbox跟踪**
-   - 低头场景保持轨迹连续性
-   - `max_lost`从8帧→20帧
-
-4. **预留扩展接口**
-   - `HeadPoseEstimator`抽象类
-   - 未来可集成MediaPipe等实现
 
 ## 📁 项目结构
 
