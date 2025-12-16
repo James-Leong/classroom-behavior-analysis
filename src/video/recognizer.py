@@ -19,7 +19,7 @@ from src.video.tracker import SimpleTracker
 logger = get_logger(__name__)
 
 
-SCHEMA_VERSION = "v1"
+SCHEMA_VERSION = "v2"  # Updated to v2 for body bbox support
 
 
 def _format_ts(seconds: float) -> str:
@@ -42,6 +42,9 @@ class VideoFaceRecognizer:
         device: str = "auto",
         rebuild_gallery: bool = False,
         iface_use_tiling: bool = True,
+        enable_person_detection: bool = True,
+        person_weights: str = "yolo11n.pt",
+        person_conf_threshold: float = 0.25,
     ):
         self.recognizer = FaceRecognizer(
             gallery_path=gallery_path,
@@ -52,6 +55,34 @@ class VideoFaceRecognizer:
         )
         self.debug_identify = bool(debug_identify)
 
+        # Person detector for body bbox tracking
+        self.person_detector = None
+        self.enable_person_detection = enable_person_detection
+        self.person_conf_threshold = float(person_conf_threshold)
+        if enable_person_detection:
+            try:
+                from src.behavior.person_detector import UltralyticsPersonDetector
+
+                self.person_detector = UltralyticsPersonDetector(
+                    weights_path=person_weights,
+                    device=device,
+                )
+                self.person_conf_threshold = float(person_conf_threshold)
+                self.person_detector_model = Path(person_weights).name
+                logger.info(f"Person检测器已启用: {person_weights}, conf={self.person_conf_threshold}")
+            except Exception as e:
+                logger.warning(f"Person检测器初始化失败，将仅使用人脸检测: {e}")
+                self.person_detector = None
+                self.enable_person_detection = False
+                self.person_detector_model = ""
+
+        # Head pose estimator (reserved interface, currently unused)
+        # Future: can be set to MediaPipeHeadPoseEstimator or other implementations
+        from src.video.head_pose import DummyHeadPoseEstimator
+
+        self.head_pose_estimator = DummyHeadPoseEstimator()
+        logger.debug("HeadPoseEstimator: 使用Dummy实现（预留接口，未来可替换为MediaPipe等）")
+
     def _build_header_meta(
         self,
         input_video: str,
@@ -61,8 +92,9 @@ class VideoFaceRecognizer:
         frame_interval_sec: float,
         frame_interval_frames: Optional[int],
         mode: str,
+        tracker_config: Optional[Dict] = None,
     ) -> Dict:
-        return {
+        meta = {
             "video": str(input_video),
             "output_video": str(output_video) if output_video is not None else None,
             "fps": float(fps),
@@ -72,6 +104,24 @@ class VideoFaceRecognizer:
             "mode": mode,
             "schema_version": SCHEMA_VERSION,
         }
+
+        # Add v2 schema extensions
+        if tracker_config:
+            meta["face_recognition_config"] = tracker_config
+
+        # Add person detection config
+        if self.person_detector is not None and self.enable_person_detection:
+            meta["person_detection_config"] = {
+                "enabled": True,
+                "model": getattr(self, "person_detector_model", "ultralytics"),
+                "confidence_threshold": getattr(self, "person_conf_threshold", 0.25),
+            }
+        else:
+            meta["person_detection_config"] = {
+                "enabled": False,
+            }
+
+        return meta
 
     def _build_frame_record(self, frame_idx: int, fps: float, detections: List[Dict]) -> Dict:
         timestamp = frame_idx / fps if fps > 0 else 0.0
@@ -116,10 +166,18 @@ class VideoFaceRecognizer:
         unlock_grace_frames: int,
         hold_unknown_frames: int,
     ) -> None:
-        """Apply hysteresis/locking to stabilize per-track displayed identity."""
+        """Apply hysteresis/locking to stabilize per-track displayed identity.
+
+        Supports body_only_tracking: when face is missing but body is tracked,
+        freeze unlock counters to maintain identity continuity.
+        """
         for tid, info in tracker.tracks.items():
             cand = str(info.get("resolved_identity") or "未知")
             sim = float(info.get("resolved_similarity", 0.0) or 0.0)
+
+            # Check if this track is in body-only tracking mode (face missing but body tracked)
+            tracklet = info.get("tracklet")
+            body_only_tracking = getattr(tracklet, "body_only_tracking", False) if tracklet else False
 
             try:
                 motion = float(info.get("motion_norm_ema", 0.0) or 0.0)
@@ -127,7 +185,8 @@ class VideoFaceRecognizer:
                 motion = 0.0
             stable_factor = 1.0 - max(0.0, min(1.0, motion / 0.25))
             try:
-                if int(info.get("lost", 0) or 0) > 0:
+                # If in body-only mode, don't penalize stability (person is still there)
+                if not body_only_tracking and int(info.get("lost", 0) or 0) > 0:
                     stable_factor *= 0.35
             except Exception:
                 pass
@@ -155,6 +214,25 @@ class VideoFaceRecognizer:
                     sw_ev = 0
                     unk = 0
 
+                    # Store locked embedding for future switch detection
+                    tracklet = info.get("tracklet")
+                    if tracklet:
+                        try:
+                            agg_emb = getattr(tracklet, "agg_embedding", None)
+                            if agg_emb is not None:
+                                info["locked_embedding"] = np.array(agg_emb, dtype=np.float32).copy()
+
+                            # Record first lock event in history
+                            lock_event = {
+                                "frame": tracklet.frame_indices[-1] if tracklet.frame_indices else 0,
+                                "identity": cand,
+                                "embedding_snapshot": agg_emb.copy() if agg_emb is not None else None,
+                                "similarity": float(sim),
+                            }
+                            tracklet.lock_history.append(lock_event)
+                        except Exception:
+                            pass
+
                 info["display_identity"] = locked if locked is not None else cand
                 info["display_similarity"] = float(info.get("locked_similarity", sim) if locked is not None else sim)
             else:
@@ -163,19 +241,71 @@ class VideoFaceRecognizer:
                     unk = 0
                     info["locked_similarity"] = float(max(float(info.get("locked_similarity", 0.0) or 0.0), sim))
                 elif cand == "未知":
-                    unk += 1
-                    if unk >= int(eff_hold_unknown_frames) and sim < float(eff_unlock_threshold):
-                        sw_ev += 1
-                    else:
-                        sw_ev = 0
+                    # If body-only tracking, freeze unlock counters (person is still there, just face missing)
+                    if not body_only_tracking:
+                        unk += 1
+                        if unk >= int(eff_hold_unknown_frames) and sim < float(eff_unlock_threshold):
+                            sw_ev += 1
+                        else:
+                            sw_ev = 0
+                    # else: freeze counters when body tracking
                 else:
                     unk = 0
-                    if sim >= float(switch_threshold):
-                        sw_ev += 1
-                    else:
-                        sw_ev = 0
+                    # If body-only tracking, freeze switch evidence (no face to evaluate switch)
+                    if not body_only_tracking:
+                        if sim >= float(switch_threshold):
+                            sw_ev += 1
+                        else:
+                            sw_ev = 0
+                    # else: freeze switch_evidence when body tracking
 
                     if sw_ev >= int(switch_min_frames):
+                        # Identity switch detected - check if it's a real switch via embedding distance
+                        should_split = False
+                        old_embedding = info.get("locked_embedding")
+                        new_embedding = getattr(info.get("tracklet"), "agg_embedding", None)
+
+                        if old_embedding is not None and new_embedding is not None:
+                            try:
+                                # Calculate cosine similarity between old and new locked embeddings
+                                from src.video.tracker import _cos_sim
+
+                                embedding_sim = _cos_sim(old_embedding, new_embedding)
+                                # If similarity < 0.72 (distance > 0.28), it's likely a real identity change
+                                if embedding_sim < 0.72:
+                                    should_split = True
+                                    logger.info(
+                                        f"轨迹 {tid} 检测到真实身份切换: {locked} -> {cand} (embedding相似度={embedding_sim:.3f})"
+                                    )
+                            except Exception as e:
+                                logger.debug(f"Embedding距离计算失败: {e}")
+
+                        if should_split:
+                            # TODO: Implement tracklet splitting logic
+                            # For now, just update the identity without splitting
+                            logger.warning(f"轨迹 {tid} 需要分割但暂未实现，当前仅切换身份")
+
+                        # Store new locked embedding
+                        if new_embedding is not None:
+                            try:
+                                info["locked_embedding"] = np.array(new_embedding, dtype=np.float32).copy()
+                            except Exception:
+                                pass
+
+                        # Record lock event in history
+                        tracklet = info.get("tracklet")
+                        if tracklet:
+                            try:
+                                lock_event = {
+                                    "frame": tracklet.frame_indices[-1] if tracklet.frame_indices else 0,
+                                    "identity": cand,
+                                    "embedding_snapshot": new_embedding.copy() if new_embedding is not None else None,
+                                    "similarity": float(sim),
+                                }
+                                tracklet.lock_history.append(lock_event)
+                            except Exception:
+                                pass
+
                         info["locked_identity"] = cand
                         info["locked_similarity"] = float(sim)
                         info["is_locked"] = True
@@ -595,6 +725,10 @@ class VideoFaceRecognizer:
         except Exception:
             pass
 
+        simple_cfg = {
+            "recognition_threshold": self.recognizer.threshold,
+        }
+
         result = self._build_header_meta(
             input_video,
             output_video if output_video else None,
@@ -603,6 +737,7 @@ class VideoFaceRecognizer:
             frame_interval_sec,
             frame_interval_frames,
             mode="simple",
+            tracker_config=simple_cfg,
         )
         result["occurrences"] = {k: [int(v) for v in vs] for k, vs in occurrences.items()}
         result["frames"] = frames_info
@@ -625,7 +760,7 @@ class VideoFaceRecognizer:
         frame_interval_frames: int = None,
         batch_frames: int = 1,
         iou_threshold: float = 0.3,
-        max_lost: int = 5,
+        max_lost: int = 20,  # Increased from 5 to 20 for better low-head robustness
         merge_similarity_threshold: float = 0.86,
         tracklet_min_votes: int = 2,
         lock_threshold: float = 0.46,
@@ -638,7 +773,6 @@ class VideoFaceRecognizer:
         ffmpeg_codec: Optional[str] = None,
         max_frames: int = None,
         max_seconds: float = None,
-        behavior_config: Optional[object] = None,
     ) -> Dict:
         tracker = SimpleTracker(iou_threshold=iou_threshold, max_lost=max_lost)
         person_map: Dict[str, int] = {}
@@ -741,12 +875,31 @@ class VideoFaceRecognizer:
                 t0 = time.time()
                 faces_batch = self.recognizer.detect_faces_batch(batch_images)
                 dt = max(1e-6, time.time() - t0)
+
+                # Detect persons (body bbox) for each frame in batch if enabled
+                persons_batch = []
+                if self.person_detector is not None and self.enable_person_detection:
+                    try:
+                        for img in batch_images:
+                            persons = self.person_detector.detect_persons(
+                                img,
+                                conf=getattr(self, "person_conf_threshold", 0.25),
+                            )
+                            persons_batch.append(persons)
+                    except Exception as e:
+                        logger.debug(f"Person检测失败: {e}")
+                        persons_batch = [[] for _ in batch_images]
+                else:
+                    persons_batch = [[] for _ in batch_images]
+
                 for local_i, global_idx in enumerate(current_batch_indices):
                     if global_idx not in frame_buffer:
                         continue
                     faces = faces_batch[local_i] if local_i < len(faces_batch) else []
+                    persons = persons_batch[local_i] if local_i < len(persons_batch) else []
                     frame_ref = frame_buffer[global_idx]
                     detections_raw: List[Dict] = []
+
                     for face in faces:
                         quality = self.recognizer.assess_face_quality(face, frame_ref.shape)
                         identity, similarity = self.recognizer.recognize_identity(
@@ -757,6 +910,24 @@ class VideoFaceRecognizer:
                             identity, person_map, next_person_pid
                         )
                         next_person_pid = next_person_pid_local
+
+                        # Match body bbox for this face
+                        body_bbox = None
+                        body_confidence = 0.0
+                        if persons:
+                            try:
+                                from src.behavior.person_detector import pick_person_bbox_for_face
+
+                                body_bbox = pick_person_bbox_for_face(persons, bbox)
+                                if body_bbox:
+                                    # Find confidence for matched body bbox
+                                    for p in persons:
+                                        if p.bbox == body_bbox:
+                                            body_confidence = p.conf
+                                            break
+                            except Exception as e:
+                                logger.debug(f"Body bbox匹配失败: {e}")
+
                         det = {
                             "bbox": bbox,
                             "embedding": face.embedding,
@@ -764,13 +935,18 @@ class VideoFaceRecognizer:
                             "identity": identity,
                             "similarity": similarity,
                             "person_id": person_id,
+                            "body_bbox": body_bbox,
+                            "body_confidence": body_confidence,
                             "landmarks": getattr(face, "kps", None),
                             "det_size": getattr(face, "det_size", None),
                             "enhancement": getattr(face, "enhancement", "original"),
                         }
                         detections_raw.append(det)
 
-                    tracker.update(detections_raw, global_idx)
+                    # Prepare body_bboxes for tracker (for body-only tracking)
+                    body_bboxes_for_tracker = [{"bbox": p.bbox, "confidence": p.conf} for p in persons]
+
+                    tracker.update(detections_raw, global_idx, body_bboxes=body_bboxes_for_tracker)
 
                     try:
                         self._refresh_track_identities(tracker)
@@ -797,6 +973,18 @@ class VideoFaceRecognizer:
                             det["track_display_identity"] = info.get("display_identity")
                             det["track_display_similarity"] = info.get("display_similarity")
                             det["track_is_locked"] = bool(info.get("is_locked", False))
+
+                            # Add face detection status
+                            tracklet_obj = info.get("tracklet")
+                            if tracklet_obj:
+                                if getattr(tracklet_obj, "body_only_tracking", False):
+                                    det["face_detection_status"] = "missing_body_tracked"
+                                elif det.get("quality", 0.0) < 0.3:
+                                    det["face_detection_status"] = "low_quality"
+                                else:
+                                    det["face_detection_status"] = "normal"
+                            else:
+                                det["face_detection_status"] = "normal"
                         ser = serialize_detection(det, frame_ref.shape)
                         export_dets.append(ser)
                     frames_info.append(self._build_frame_record(global_idx, fps, export_dets))
@@ -1015,6 +1203,22 @@ class VideoFaceRecognizer:
                 identity = det.get("identity", "未知")
                 occurrences.setdefault(identity, []).append(frame_no)
 
+        tracker_cfg = {
+            "iou_threshold": float(iou_threshold),
+            "max_lost": int(max_lost),
+            "appearance_threshold": tracker.appearance_threshold,
+            "merge_similarity_threshold": float(merge_similarity_threshold),
+            "tracklet_min_votes": int(tracklet_min_votes),
+            "lock_threshold": float(lock_threshold),
+            "lock_min_frames": int(lock_min_frames),
+            "switch_threshold": float(switch_threshold),
+            "switch_min_frames": int(switch_min_frames),
+            "unlock_threshold": float(unlock_threshold),
+            "unlock_grace_frames": int(unlock_grace_frames),
+            "hold_unknown_frames": int(hold_unknown_frames),
+            "recognition_threshold": self.recognizer.threshold,
+        }
+
         result = self._build_header_meta(
             input_video,
             output_video,
@@ -1023,24 +1227,11 @@ class VideoFaceRecognizer:
             frame_interval_sec,
             frame_interval_frames,
             mode="tracklet",
+            tracker_config=tracker_cfg,
         )
         result["occurrences"] = {k: [int(v) for v in vs] for k, vs in occurrences.items()}
         result["frames"] = frames_info
         result["tracklets"] = tracklets_out
-
-        if behavior_config is not None and getattr(behavior_config, "enabled", False):
-            try:
-                from src.behavior.pipeline import run_behavior_pipeline_on_result
-
-                behavior_stats = run_behavior_pipeline_on_result(
-                    input_video=str(input_video),
-                    result=result,
-                    cfg=behavior_config,  # type: ignore[arg-type]
-                )
-                if behavior_stats is not None:
-                    result["behavior_stats"] = behavior_stats
-            except Exception:
-                logger.warning("behavior 已启用但统计生成失败（已忽略）", exc_info=True)
 
         Path(output_json).parent.mkdir(parents=True, exist_ok=True)
         with open(output_json, "w", encoding="utf-8") as f:

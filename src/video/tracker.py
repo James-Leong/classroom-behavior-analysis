@@ -59,8 +59,30 @@ class Tracklet:
     agg_embedding: Optional[np.ndarray] = None
     agg_weight: float = 0.0
 
+    # Body bbox tracking for low-head scenarios (when face detection fails)
+    body_bboxes: List[Optional[List[int]]] = field(default_factory=list)
+    body_confidences: List[float] = field(default_factory=list)
+    last_body_bbox: Optional[List[int]] = None
+
+    # Face detection status tracking
+    face_lost_frames: int = 0
+    body_lost_frames: int = 0
+    body_only_tracking: bool = False
+
+    # Identity locking history for tracklet splitting
+    first_detected_frame: Optional[int] = None
+    lock_history: List[Dict] = field(default_factory=list)  # [{frame, identity, embedding_snapshot, similarity}]
+
     def add(
-        self, frame_idx: int, bbox: List[int], embedding: np.ndarray, quality: float, identity: str, similarity: float
+        self,
+        frame_idx: int,
+        bbox: List[int],
+        embedding: np.ndarray,
+        quality: float,
+        identity: str,
+        similarity: float,
+        body_bbox: Optional[List[int]] = None,
+        body_confidence: float = 0.0,
     ):
         self.frame_indices.append(int(frame_idx))
         self.bboxes.append([int(x) for x in bbox])
@@ -68,6 +90,16 @@ class Tracklet:
         self.qualities.append(float(quality))
         self.identities.append(str(identity))
         self.similarities.append(float(similarity))
+
+        # Track body bbox
+        self.body_bboxes.append([int(x) for x in body_bbox] if body_bbox else None)
+        self.body_confidences.append(float(body_confidence))
+        if body_bbox:
+            self.last_body_bbox = [int(x) for x in body_bbox]
+
+        # Record first detection frame
+        if self.first_detected_frame is None:
+            self.first_detected_frame = int(frame_idx)
 
         # Update online aggregated embedding.
         try:
@@ -107,16 +139,18 @@ class SimpleTracker:
     def __init__(
         self,
         iou_threshold: float = 0.3,
-        max_lost: int = 5,
+        max_lost: int = 20,  # Increased from 5 to 20 for better low-head robustness
         appearance_threshold: float = 0.72,
         max_center_dist_ratio: float = 1.10,
         motion_alpha: float = 0.75,
+        body_iou_threshold: float = 0.5,  # Threshold for body-only tracking
     ):
         self.iou_threshold = float(iou_threshold)
         self.max_lost = int(max_lost)
         self.appearance_threshold = float(appearance_threshold)
         self.max_center_dist_ratio = float(max_center_dist_ratio)
         self.motion_alpha = float(motion_alpha)
+        self.body_iou_threshold = float(body_iou_threshold)
         self.next_id = 1
         self.tracks: Dict[int, Dict] = {}
         self.person_to_track: Dict[int, int] = {}
@@ -160,7 +194,17 @@ class SimpleTracker:
         except Exception:
             pass
 
-    def update(self, detections: List[Dict], frame_idx: int) -> List[Tracklet]:
+    def update(
+        self, detections: List[Dict], frame_idx: int, body_bboxes: Optional[List[Dict]] = None
+    ) -> List[Tracklet]:
+        """
+        Update tracks with new detections.
+
+        Args:
+            detections: List of face detections with bbox, embedding, etc.
+            frame_idx: Current frame index
+            body_bboxes: Optional list of body detections [{bbox: [x1,y1,x2,y2], confidence: float}]
+        """
         assigned = set()
         det_bboxes = [d["bbox"] for d in detections]
 
@@ -169,6 +213,7 @@ class SimpleTracker:
             e = d.get("embedding")
             det_embs.append(np.asarray(e, dtype=np.float32).reshape(-1) if e is not None else None)
 
+        # Phase 1: Match face detections to existing tracks
         for tid, info in list(self.tracks.items()):
             best_iou = 0.0
             best_j = -1
@@ -227,8 +272,18 @@ class SimpleTracker:
             if best_j >= 0 and accept:
                 d = detections[best_j]
                 d["track_id"] = tid
+                # Get body bbox if available
+                body_bbox = d.get("body_bbox")
+                body_conf = d.get("body_confidence", 0.0)
                 info["tracklet"].add(
-                    frame_idx, d["bbox"], d["embedding"], d["quality"], d["identity"], d["similarity"]
+                    frame_idx,
+                    d["bbox"],
+                    d["embedding"],
+                    d["quality"],
+                    d["identity"],
+                    d["similarity"],
+                    body_bbox=body_bbox,
+                    body_confidence=body_conf,
                 )
                 info["last_bbox"] = d["bbox"]
                 self._update_motion(info, d["bbox"])
@@ -237,9 +292,80 @@ class SimpleTracker:
                     info["person_id"] = d.get("person_id")
                     self.person_to_track[d["person_id"]] = tid
                 info["lost"] = 0
+                info["tracklet"].face_lost_frames = 0
+                info["tracklet"].body_only_tracking = False
                 assigned.add(best_j)
             else:
                 info["lost"] += 1
+                info["tracklet"].face_lost_frames += 1
+
+        # Phase 2: Try body bbox matching for tracks that lost face detection
+        # IMPORTANT: Only process tracks that were NOT matched in Phase 1
+        assigned_bodies = set()
+        tracks_matched_in_phase1 = set()
+        for d in detections:
+            if d.get("track_id") is not None:
+                tracks_matched_in_phase1.add(d["track_id"])
+
+        if body_bboxes:
+            for tid, info in list(self.tracks.items()):
+                # Skip tracks that were successfully matched in Phase 1
+                if tid in tracks_matched_in_phase1:
+                    continue
+
+                # Only try body matching if face detection failed for >=2 frames and we have last_body_bbox
+                if info["lost"] >= 2 and info["lost"] <= self.max_lost:
+                    tracklet = info["tracklet"]
+                    if tracklet.last_body_bbox is None:
+                        continue
+
+                    best_body_iou = 0.0
+                    best_body_idx = -1
+
+                    for b_idx, body_det in enumerate(body_bboxes):
+                        if b_idx in assigned_bodies:
+                            continue
+                        body_bbox = body_det.get("bbox")
+                        if not body_bbox:
+                            continue
+
+                        try:
+                            iou = _iou(tracklet.last_body_bbox, body_bbox)
+                            if iou > best_body_iou:
+                                best_body_iou = iou
+                                best_body_idx = b_idx
+                        except Exception:
+                            continue
+
+                    # If body IoU is high enough, maintain the track with body-only tracking
+                    if best_body_idx >= 0 and best_body_iou >= self.body_iou_threshold:
+                        body_det = body_bboxes[best_body_idx]
+                        body_bbox = body_det["bbox"]
+                        body_conf = body_det.get("confidence", 0.0)
+
+                        # Mark as body-only tracking (no face detection this frame)
+                        tracklet.body_only_tracking = True
+                        tracklet.last_body_bbox = body_bbox
+                        tracklet.body_lost_frames = 0
+                        info["lost"] = 0  # Reset lost counter since we're tracking via body
+
+                        # Record this frame even without face detection
+                        # Use empty/dummy values for face-specific fields
+                        tracklet.frame_indices.append(int(frame_idx))
+                        tracklet.bboxes.append([0, 0, 0, 0])  # Placeholder, no face bbox
+                        tracklet.embeddings.append(
+                            np.zeros_like(tracklet.embeddings[-1] if tracklet.embeddings else np.zeros(512))
+                        )
+                        tracklet.qualities.append(0.0)
+                        tracklet.identities.append("未知")  # Will be maintained by lock logic
+                        tracklet.similarities.append(0.0)
+                        tracklet.body_bboxes.append([int(x) for x in body_bbox])
+                        tracklet.body_confidences.append(float(body_conf))
+
+                        info["last_seen"] = int(frame_idx)
+                        assigned_bodies.add(best_body_idx)
+                    else:
+                        tracklet.body_lost_frames += 1
 
         for j, d in enumerate(detections):
             if j in assigned:
@@ -255,14 +381,25 @@ class SimpleTracker:
                 tid = existing_tid
                 info = self.tracks[tid]
                 d["track_id"] = tid
+                body_bbox = d.get("body_bbox")
+                body_conf = d.get("body_confidence", 0.0)
                 info["tracklet"].add(
-                    frame_idx, d["bbox"], d["embedding"], d["quality"], d["identity"], d["similarity"]
+                    frame_idx,
+                    d["bbox"],
+                    d["embedding"],
+                    d["quality"],
+                    d["identity"],
+                    d["similarity"],
+                    body_bbox=body_bbox,
+                    body_confidence=body_conf,
                 )
                 info["last_bbox"] = d["bbox"]
                 self._update_motion(info, d["bbox"])
                 info["last_seen"] = int(frame_idx)
                 info["person_id"] = pid
                 info["lost"] = 0
+                info["tracklet"].face_lost_frames = 0
+                info["tracklet"].body_only_tracking = False
                 assigned.add(j)
                 continue
 
@@ -270,7 +407,18 @@ class SimpleTracker:
             self.next_id += 1
             t = Tracklet(id=tid)
             d["track_id"] = tid
-            t.add(frame_idx, d["bbox"], d["embedding"], d["quality"], d["identity"], d["similarity"])
+            body_bbox = d.get("body_bbox")
+            body_conf = d.get("body_confidence", 0.0)
+            t.add(
+                frame_idx,
+                d["bbox"],
+                d["embedding"],
+                d["quality"],
+                d["identity"],
+                d["similarity"],
+                body_bbox=body_bbox,
+                body_confidence=body_conf,
+            )
             self.tracks[tid] = {
                 "tracklet": t,
                 "last_bbox": d["bbox"],
@@ -285,6 +433,7 @@ class SimpleTracker:
                 "unknown_streak": 0,
                 "locked_identity": None,
                 "locked_similarity": 0.0,
+                "locked_embedding": None,  # Store embedding snapshot when locked
                 "display_identity": None,
                 "display_similarity": 0.0,
                 "is_locked": False,

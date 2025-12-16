@@ -39,37 +39,31 @@ class CLIPVideoActionModel:
         - All preprocessing done in batched GPU operations
         - Single memory transfer from CPU to GPU per clip
         - No intermediate PIL Image conversions
-        - Frame subsampling reduces computation by 2-8x
+        - Batch inference processes multiple clips in one forward pass
+
         Example:
             >>> model = CLIPVideoActionModel(device='cuda')
             >>> clip = np.random.randint(0, 255, (16, 224, 224, 3), dtype=np.uint8)
-            >>> scores, top = model.predict_proba(clip, topk=5)
+            >>> scores, top = model.predict_proba(clip, topk=3)
     """
 
     # Default classroom behavior descriptions (English)
+    # Simplified to 5 robust categories for better accuracy with small faces in surveillance video
     DEFAULT_BEHAVIORS = [
-        "a student holding a pen and writing on a notebook or tablet",
-        "a student holding and reading a textbook or flipping through pages of a book",
-        "a student sitting and looking straight ahead at the front of classroom",
-        "a student holding a smartphone in hands and looking down at the phone screen with head lowered",
-        "a student looking at a laptop computer screen on desk with hands on keyboard",
-        "a student picking up a water bottle or cup, drinking water and putting it down",
-        "a student looking around in different directions, not looking straight ahead",
-        "a student with arms on desk and head lying down on the desk, or with eyes completely closed",
-        "a student turning head to talk with a classmate sitting nearby",
+        "a student sitting and looking straight ahead at the front of classroom, attentive and listening",
+        "a student reading a textbook or writing notes with pen, focused on paper or book",
+        "a student looking at and interacting with computer keyboard or smartphone screen, hands visible with device",
+        "a student looking around in different directions with head turning, not focused, distracted",
+        "other activity or unclear action not matching specific behaviors",
     ]
 
     # Short labels for output (matched to behaviors)
     DEFAULT_LABELS = [
-        "taking_notes",
-        "reading",
         "listening",
-        "using_phone",
-        "using_computer",
-        "drinking",
+        "reading_or_writing",
+        "using_device",
         "distracted",
-        "sleeping",
-        "talking",
+        "other",
     ]
 
     def __init__(
@@ -78,7 +72,6 @@ class CLIPVideoActionModel:
         device: str = "auto",
         custom_behaviors: Optional[List[str]] = None,
         custom_labels: Optional[List[str]] = None,
-        frame_subsample: int = 4,  # Process every Nth frame for speed
     ) -> None:
         """Initialize CLIP model.
 
@@ -88,10 +81,8 @@ class CLIPVideoActionModel:
             device: Device ('auto', 'cuda', 'cpu')
             custom_behaviors: Custom behavior text descriptions
             custom_labels: Custom short labels (must match behaviors length)
-            frame_subsample: Process every Nth frame (1=all frames, 4=every 4th)
         """
         self.model_name = str(model_name)
-        self.frame_subsample = max(1, int(frame_subsample))
 
         # Device setup
         dev = str(device).strip().lower()
@@ -108,10 +99,7 @@ class CLIPVideoActionModel:
         try:
             import clip
         except ImportError as e:
-            raise ImportError(
-                "CLIP not installed. Run: pip install ftfy regex tqdm && "
-                "pip install git+https://github.com/openai/CLIP.git"
-            ) from e
+            raise ImportError("CLIP not installed. Run: pip install ftfy regex tqdm && pip install openai-clip") from e
 
         self.model, self.preprocess = clip.load(self.model_name, device=self.device)
         self.model.eval()
@@ -134,7 +122,7 @@ class CLIPVideoActionModel:
             self.text_features = self.model.encode_text(text_inputs)
             self.text_features /= self.text_features.norm(dim=-1, keepdim=True)
 
-        logger.info(f"CLIP model ready with {len(self.behaviors)} behaviors (frame_subsample={self.frame_subsample})")
+        logger.info(f"CLIP model ready with {len(self.behaviors)} behaviors")
 
     def _preprocess_frames_batch(self, frames: np.ndarray) -> torch.Tensor:
         """Preprocess frames batch directly without PIL conversion (GPU-optimized).
@@ -172,13 +160,8 @@ class CLIPVideoActionModel:
         Returns:
             Normalized frame features (T, D)
         """
-        # Subsample frames for speed
-        if self.frame_subsample > 1:
-            indices = list(range(0, frames.shape[0], self.frame_subsample))
-            frames = frames[indices]
-
         if frames.shape[0] == 0:
-            raise ValueError("No frames after subsampling")
+            raise ValueError("Empty frames array")
 
         # Preprocess all frames in batch on GPU (no PIL conversion)
         batch = self._preprocess_frames_batch(frames)  # (T, 3, 224, 224)
@@ -227,6 +210,83 @@ class CLIPVideoActionModel:
 
         return scores, top_obj
 
+    def _predict_batch_optimized(
+        self, clips: List[np.ndarray], topk: int
+    ) -> Tuple[List[Dict[str, float]], List[ActionTopK]]:
+        """真正的批量推理：所有clips的所有帧一起编码，最大化GPU利用率.
+
+        Args:
+            clips: List of (T, H, W, 3) uint8 arrays
+            topk: Number of top predictions
+
+        Returns:
+            (list[scores_dict], list[ActionTopK])
+        """
+        if not clips:
+            return [], []
+
+        # 1. 预处理所有clips并收集frames（先转换为tensor以避免numpy shape不匹配）
+        all_frame_tensors = []
+        clip_frame_counts = []
+
+        for clip in clips:
+            if not isinstance(clip, np.ndarray) or clip.ndim != 4:
+                raise ValueError("Each clip must be (T,H,W,3)")
+
+            if clip.shape[0] == 0:
+                raise ValueError("Empty clip")
+
+            # 预处理此clip的所有帧（resize到224x224并归一化）
+            frame_tensor = self._preprocess_frames_batch(clip)  # (T, 3, 224, 224)
+            all_frame_tensors.append(frame_tensor)
+            clip_frame_counts.append(frame_tensor.shape[0])
+
+        # 2. 合并所有预处理后的帧tensor: (total_frames, 3, 224, 224)
+        all_frames_concat = torch.cat(all_frame_tensors, dim=0)
+
+        # 3. 一次性编码所有帧（已经预处理过了）
+        with torch.no_grad():
+            all_features = self.model.encode_image(all_frames_concat)  # (total_frames, D)
+            all_features = all_features / all_features.norm(dim=-1, keepdim=True)
+
+        # 4. 按clip分割特征并进行temporal aggregation
+        start_idx = 0
+        video_features_list = []
+
+        for frame_count in clip_frame_counts:
+            end_idx = start_idx + frame_count
+            clip_features = all_features[start_idx:end_idx]  # (T', D)
+
+            # Temporal aggregation: mean pooling
+            video_feature = clip_features.mean(dim=0, keepdim=True)  # (1, D)
+            video_feature = video_feature / video_feature.norm(dim=-1, keepdim=True)
+            video_features_list.append(video_feature)
+
+            start_idx = end_idx
+
+        # 5. 批量计算所有video features与text features的相似度
+        video_features_batch = torch.cat(video_features_list, dim=0)  # (B, D)
+        similarity = (100.0 * video_features_batch @ self.text_features.T).softmax(dim=-1)  # (B, N_behaviors)
+        probs_batch = similarity.cpu().numpy()  # (B, N_behaviors)
+
+        # 6. 构建输出
+        scores_list = []
+        tops_list = []
+
+        for probs in probs_batch:
+            scores = {self.labels[i]: float(probs[i]) for i in range(len(self.labels))}
+            scores_list.append(scores)
+
+            if topk <= 0:
+                tops_list.append(ActionTopK(categories=[]))
+            else:
+                k = min(int(topk), len(self.labels))
+                idxs = np.argsort(-probs)[:k]
+                top = [(self.labels[i], float(probs[i])) for i in idxs]
+                tops_list.append(ActionTopK(categories=top))
+
+        return scores_list, tops_list
+
     def predict_proba(
         self,
         clip_rgb_uint8: Union[np.ndarray, Sequence[np.ndarray]],
@@ -253,13 +313,8 @@ class CLIPVideoActionModel:
         if not clips:
             return [], []
 
-        scores_list = []
-        tops_list = []
-
-        for clip in clips:
-            scores, top = self._predict_single(clip, topk)
-            scores_list.append(scores)
-            tops_list.append(top)
+        # 使用优化的批处理方法
+        scores_list, tops_list = self._predict_batch_optimized(clips, topk)
 
         if is_batch:
             return scores_list, tops_list

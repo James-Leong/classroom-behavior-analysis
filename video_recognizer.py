@@ -1,15 +1,15 @@
-"""兼容入口：保留 `from video_recognizer import VideoFaceRecognizer`。
+"""视频人脸识别工具：专注于人脸检测、识别和轨迹跟踪。
 
-实现已拆分到 `src/video/` 包内；此文件仅保留薄封装与 CLI。
+本工具已重构，仅负责人脸识别部分，输出包含人脸和body bbox的JSON文件。
+行为识别功能已解耦，请使用独立的 behavior_analyzer.py 工具。
+
+实现已拆分到 `src/video/` 包内；此文件仅保留CLI入口。
 """
 
 from __future__ import annotations
 
 import argparse
 import time
-
-from src.behavior.pipeline import BehaviorPipelineConfig
-from src.behavior.stats import BehaviorSeriesConfig
 
 from src.utils.log import get_logger
 from src.video.recognizer import SCHEMA_VERSION, VideoFaceRecognizer
@@ -39,7 +39,7 @@ def main() -> None:
         choices=[0, 1],
         help="是否启用 InsightFace 平铺检测回退（默认 1）",
     )
-    parser.add_argument("--interval", "-i", type=float, help="抽帧间隔（秒），默认 2.0", default=2.0)
+    parser.add_argument("--interval", "-i", type=float, help="抽帧间隔（秒），默认 1.0", default=1.0)
     parser.add_argument("--interval-frames", "-f", type=int, help="抽帧间隔（帧数），如果指定则优先使用", default=None)
     parser.add_argument(
         "--mode", "-m", choices=["simple", "tracklet"], default="tracklet", help="识别模式：simple 或 tracklet"
@@ -47,7 +47,7 @@ def main() -> None:
     parser.add_argument("--batch-frames", type=int, default=32, help="批量处理的帧数，>1 时启用多帧批识别")
     parser.add_argument("--iou-threshold", type=float, default=0.3, help="轨迹模式 IoU 阈值")
     parser.add_argument("--max-lost", type=int, default=8, help="轨迹模式允许的最大丢失帧数")
-    parser.add_argument("--merge-sim-threshold", type=float, default=0.86, help="轨迹合并相似度阈值")
+    parser.add_argument("--merge-sim-threshold", type=float, default=0.7, help="轨迹合并相似度阈值")
     parser.add_argument("--debug-identify", action="store_true", help="在识别时输出 top-k 相似度用于调试")
     parser.add_argument("--recognition-threshold", "-t", type=float, default=0.3, help="覆盖识别器的单帧相似度阈值")
     parser.add_argument("--tracklet-min-votes", type=int, default=2, help="轨迹内最小票数阈值")
@@ -68,62 +68,35 @@ def main() -> None:
         help="指定 ffmpeg 编码器（默认自动优先 h264_nvenc，其次 libx264，最后 mpeg4）",
     )
 
-    # Behavior analysis (video action model)
-    parser.add_argument("--behavior", action="store_true", help="启用视频行为识别并输出 behavior_stats")
+    # Person detection (body bbox) for robust tracking
     parser.add_argument(
-        "--behavior-target",
-        action="append",
-        default=None,
-        help="指定学生姓名（可重复多次），姓名需与图库目录名一致；不指定则统计所有已锁定身份",
-    )
-
-    # Model type selection
-    parser.add_argument(
-        "--behavior-model-type",
-        type=str,
-        default="kinetics",
-        choices=["kinetics", "clip"],
-        help="行为识别模型类型: kinetics(Kinetics预训练) 或 clip(零样本自定义)",
-    )
-
-    # Kinetics model options
-    parser.add_argument(
-        "--behavior-model",
-        type=str,
-        default="swin3d_t",
-        choices=["swin3d_t", "mvit_v1_b", "s3d", "r3d_18"],
-        help="Kinetics模型选择（仅当model-type=kinetics时）",
-    )
-
-    # CLIP model options
-    parser.add_argument(
-        "--behavior-clip-model",
-        type=str,
-        default="ViT-B/32",
-        choices=["ViT-B/32", "ViT-B/16", "ViT-L/14"],
-        help="CLIP模型选择（仅当model-type=clip时）: ViT-B/32(快), ViT-B/16(平衡), ViT-L/14(准)",
+        "--enable-person-detection",
+        action="store_true",
+        default=True,
+        help="启用person检测以获取body bbox（默认启用，用于低头场景持续跟踪）",
     )
     parser.add_argument(
-        "--behavior-clip-subsample",
-        type=int,
-        default=4,
-        help="CLIP模式下每N帧处理一次（1=全部帧，4=每4帧），用于加速",
+        "--disable-person-detection",
+        action="store_true",
+        help="禁用person检测（仅使用人脸检测）",
     )
-    parser.add_argument("--behavior-clip-seconds", type=float, default=3.0, help="动作模型 clip 时间窗（秒）")
-    parser.add_argument("--behavior-clip-frames", type=int, default=24, help="动作模型采样帧数")
     parser.add_argument(
-        "--behavior-person-weights",
+        "--person-weights",
         type=str,
         default="yolo11n.pt",
-        help="person 检测权重路径（Ultralytics YOLO）",
+        help="Person检测模型权重路径（Ultralytics YOLO，默认yolo11n.pt）",
     )
-    parser.add_argument("--behavior-person-conf", type=float, default=0.25, help="person 检测置信度阈值")
-    parser.add_argument("--behavior-th-on", type=float, default=0.60, help="行为进入阈值")
-    parser.add_argument("--behavior-th-off", type=float, default=0.45, help="行为退出阈值")
-    parser.add_argument("--behavior-min-seconds", type=float, default=0.50, help="最短行为持续时间（秒）")
-    parser.add_argument("--behavior-merge-gap", type=float, default=0.30, help="同类行为段合并间隙（秒）")
+    parser.add_argument(
+        "--person-conf",
+        type=float,
+        default=0.25,
+        help="Person检测置信度阈值（默认0.25）",
+    )
 
     args = parser.parse_args()
+
+    # Determine person detection enabled status
+    enable_person_detection = args.enable_person_detection and not args.disable_person_detection
 
     vfr = VideoFaceRecognizer(
         gallery_path=args.gallery,
@@ -132,6 +105,9 @@ def main() -> None:
         device=str(args.device),
         rebuild_gallery=bool(args.rebuild_gallery),
         iface_use_tiling=bool(int(args.iface_use_tiling)),
+        enable_person_detection=enable_person_detection,
+        person_weights=args.person_weights,
+        person_conf_threshold=args.person_conf,
     )
 
     if args.recognition_threshold is not None:
@@ -142,28 +118,6 @@ def main() -> None:
             logger.warning("设置 recognition_threshold 失败，忽略")
 
     if args.mode == "tracklet":
-        behavior_cfg = None
-        if bool(args.behavior):
-            behavior_cfg = BehaviorPipelineConfig(
-                enabled=True,
-                target_names=args.behavior_target,
-                model_type=str(args.behavior_model_type),
-                action_model_name=str(args.behavior_model),
-                clip_model_name=str(args.behavior_clip_model),
-                clip_frame_subsample=int(args.behavior_clip_subsample),
-                device=str(args.device),
-                batch_size_cap=int(args.batch_frames),
-                clip_seconds=float(args.behavior_clip_seconds),
-                clip_num_frames=int(args.behavior_clip_frames),
-                person_detector_weights=str(args.behavior_person_weights),
-                person_conf=float(args.behavior_person_conf),
-                series_cfg=BehaviorSeriesConfig(
-                    th_on=float(args.behavior_th_on),
-                    th_off=float(args.behavior_th_off),
-                    min_duration_seconds=float(args.behavior_min_seconds),
-                    merge_gap_seconds=float(args.behavior_merge_gap),
-                ),
-            )
         vfr.process_with_tracklets(
             args.input,
             args.output_video,
@@ -185,7 +139,6 @@ def main() -> None:
             unlock_grace_frames=args.unlock_grace_frames,
             hold_unknown_frames=args.hold_unknown_frames,
             ffmpeg_codec=args.ffmpeg_codec,
-            behavior_config=behavior_cfg,
         )
     else:
         vfr.process(

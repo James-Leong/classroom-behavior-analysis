@@ -56,6 +56,18 @@ def serialize_detection(det: Dict, frame_shape: Optional[Tuple[int, int]] = None
             ed["embedding_norm"] = None
         ed.pop("embedding", None)
 
+    # Serialize body_bbox if present
+    if "body_bbox" in ed and ed["body_bbox"] is not None:
+        try:
+            ed["body_bbox"] = [int(x) for x in ed["body_bbox"]]
+        except Exception:
+            ed["body_bbox"] = None
+    if "body_confidence" in ed:
+        try:
+            ed["body_confidence"] = float(ed["body_confidence"])
+        except Exception:
+            pass
+
     if frame_shape is not None and ed.get("bbox"):
         try:
             h, w = frame_shape[0], frame_shape[1]
@@ -66,9 +78,17 @@ def serialize_detection(det: Dict, frame_shape: Optional[Tuple[int, int]] = None
                 ed["center_norm"] = [round(cx / w, 4), round(cy / h, 4)]
             else:
                 ed["center_norm"] = None
+
+            # Normalize body_bbox as well
+            if ed.get("body_bbox"):
+                bx1, by1, bx2, by2 = ed["body_bbox"]
+                ed["body_bbox_norm"] = [round(bx1 / w, 4), round(by1 / h, 4), round(bx2 / w, 4), round(by2 / h, 4)]
+            else:
+                ed["body_bbox_norm"] = None
         except Exception:
             ed["bbox_norm"] = None
             ed["center_norm"] = None
+            ed["body_bbox_norm"] = None
 
     return ed
 

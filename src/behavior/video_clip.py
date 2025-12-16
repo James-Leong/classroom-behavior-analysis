@@ -54,14 +54,31 @@ def expand_bbox_xyxy(
     return _clip_bbox_xyxy([nx1, ny1, nx2, ny2], width, height)
 
 
-def sample_frame_indices(center_frame: int, fps: float, window_seconds: float, num_frames: int) -> List[int]:
+def sample_frame_indices(
+    center_frame: int, fps: float, window_seconds: float, num_frames: int, max_frame: int = None
+) -> List[int]:
+    """Sample frame indices around a center frame.
+
+    Args:
+        center_frame: Center frame index
+        fps: Video FPS
+        window_seconds: Time window in seconds
+        num_frames: Number of frames to sample
+        max_frame: Maximum frame index (exclusive), None for no limit
+
+    Returns:
+        List of frame indices, clipped to [0, max_frame)
+    """
     if fps <= 0:
         fps = 25.0
     half = float(window_seconds) * 0.5
     start_t = (float(center_frame) / fps) - half
     end_t = (float(center_frame) / fps) + half
     if num_frames <= 1:
-        return [int(center_frame)]
+        fi = int(center_frame)
+        if max_frame is not None and fi >= max_frame:
+            fi = max(0, max_frame - 1)
+        return [max(0, fi)]
 
     out: List[int] = []
     for i in range(int(num_frames)):
@@ -70,6 +87,8 @@ def sample_frame_indices(center_frame: int, fps: float, window_seconds: float, n
         fi = int(round(t * fps))
         if fi < 0:
             fi = 0
+        if max_frame is not None and fi >= max_frame:
+            fi = max(0, max_frame - 1)
         out.append(fi)
     # Ensure monotonic non-decreasing indices
     for i in range(1, len(out)):

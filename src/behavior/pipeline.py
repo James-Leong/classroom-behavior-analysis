@@ -14,6 +14,7 @@ from src.behavior.report import build_behavior_stats
 from src.behavior.stats import BehaviorSeriesConfig
 from src.behavior.video_clip import crop_clip, read_frames_by_index, sample_frame_indices
 from src.utils.log import get_logger
+from src.video.ffmpeg_reader import FFmpegFrameReader
 
 logger = get_logger(__name__)
 
@@ -31,26 +32,25 @@ class BehaviorPipelineConfig:
 
     # CLIP model config (when model_type="clip")
     clip_model_name: str = "ViT-B/32"  # ViT-B/32, ViT-B/16, ViT-L/14
-    clip_frame_subsample: int = 4  # Process every Nth frame for speed
     clip_custom_behaviors: Optional[List[str]] = None
     clip_custom_labels: Optional[List[str]] = None
 
     # Device: reuse top-level --device (auto/cpu/gpu). Internally maps gpu->cuda.
     device: str = "auto"
 
-    # Batch cap: can reuse top-level --batch-frames as an upper bound.
-    batch_size_cap: int = 1
-
     # Clip
     clip_seconds: float = 2.0
     clip_num_frames: int = 16
 
-    # Person detector (required): used to get body bbox
-    person_detector_weights: str = "yolo11n.pt"
+    # Person detector (optional): if None, will use body_bbox from JSON (v2 schema)
+    person_detector_weights: Optional[str] = "yolo11n.pt"
     person_conf: float = 0.25
 
     # Segmentation
     series_cfg: BehaviorSeriesConfig = field(default_factory=BehaviorSeriesConfig)
+
+    # Lock status filtering (v2 feature)
+    ignore_lock_status: bool = False  # If True, analyze all detections regardless of lock status
 
 
 def _normalize_target_names(names: Optional[List[str]]) -> Optional[Set[str]]:
@@ -121,8 +121,11 @@ def run_behavior_pipeline_on_result(
                 continue
             if target is not None and name not in target:
                 continue
-            if not bool(det.get("track_is_locked", False)):
-                continue
+
+            # Check lock status (can be bypassed with ignore_lock_status flag)
+            if not cfg.ignore_lock_status:
+                if not bool(det.get("track_is_locked", False)):
+                    continue
 
             score = float(det.get("track_display_similarity", 0.0) or 0.0)
             q = float(det.get("quality", 0.0) or 0.0)
@@ -159,23 +162,47 @@ def run_behavior_pipeline_on_result(
             device=dev,
             custom_behaviors=cfg.clip_custom_behaviors,
             custom_labels=cfg.clip_custom_labels,
-            frame_subsample=cfg.clip_frame_subsample,
         )
     else:
         logger.info(f"Using Kinetics pretrained model: {cfg.action_model_name}")
         action_model = TorchvisionVideoActionModel(model_name=cfg.action_model_name, device=dev)
 
-    try:
-        person_detector = UltralyticsPersonDetector(weights_path=cfg.person_detector_weights, device=dev)
-    except Exception as e:
-        raise RuntimeError("behavior: failed to init required person detector") from e
+    # Person detector is optional in v2: if not provided, use body_bbox from JSON
+    person_detector = None
+    if cfg.person_detector_weights is not None:
+        try:
+            person_detector = UltralyticsPersonDetector(weights_path=cfg.person_detector_weights, device=dev)
+            logger.info(f"Person检测器已启用: {cfg.person_detector_weights}")
+        except Exception as e:
+            logger.warning(f"Person检测器初始化失败，将尝试使用JSON中的body_bbox: {e}")
+            person_detector = None
+    else:
+        logger.info("Person检测器未启用，将使用JSON中的body_bbox（v2 schema）")
 
+    # Use ffmpeg for faster video reading with hardware acceleration
+    try:
+        ffmpeg_reader = FFmpegFrameReader(str(input_video), hwaccel="auto")
+        use_ffmpeg = True
+        max_frame_index = ffmpeg_reader.total_frames
+        logger.info(
+            f"Using FFmpeg for video decoding (hwaccel={ffmpeg_reader.hwaccel or 'none'}, total_frames={max_frame_index})"
+        )
+    except Exception as e:
+        logger.warning(f"FFmpeg reader initialization failed, falling back to OpenCV: {e}")
+        ffmpeg_reader = None
+        use_ffmpeg = False
+        max_frame_index = None
+
+    # Fallback to OpenCV if ffmpeg fails
     cap = cv2.VideoCapture(str(input_video))
     if not cap.isOpened():
         raise RuntimeError(f"cannot open video for behavior analysis: {input_video}")
 
-    # width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    # height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    # Get total frames if not already set
+    if max_frame_index is None:
+        max_frame_index = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if max_frame_index > 0:
+            logger.info(f"Video has {max_frame_index} frames (from OpenCV)")
 
     per_student_scores: Dict[str, Dict[str, Dict[int, float]]] = {}
 
@@ -187,33 +214,16 @@ def run_behavior_pipeline_on_result(
     progress_every = max(1, min(25, total_tasks // 20 if total_tasks > 0 else 10))
     t0 = time.time()
 
-    # Batch settings (reuse top-level batch cap but clamp to a safe range)
-    batch_cap = max(1, int(cfg.batch_size_cap) if int(cfg.batch_size_cap) > 0 else 1)
-    behavior_batch = max(1, min(batch_cap, 8 if dev == "cuda" else 4))
-
     try:
-        logger.info(
-            f"behavior: device={dev}, batch_cap={batch_cap}, behavior_batch={behavior_batch}, clip={cfg.clip_num_frames}f/{cfg.clip_seconds:.2f}s"
-        )
+        logger.info(f"behavior: device={dev}, clip={cfg.clip_num_frames}f/{cfg.clip_seconds:.2f}s")
     except Exception:
         pass
 
     # Iterate sampled frames in order.
-    for fidx in sorted(selected.keys()):
+    sorted_keys = sorted(selected.keys())
+
+    for idx, fidx in enumerate(sorted_keys):
         names_to_det = selected[fidx]
-
-        # Read keyframe first (for person detection / crop selection)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, float(fidx))
-        ok, key_bgr = cap.read()
-        if not ok or key_bgr is None:
-            logger.debug(f"behavior: failed to read keyframe {fidx}")
-            continue
-
-        persons = []
-        try:
-            persons = person_detector.detect_persons(key_bgr, conf=cfg.person_conf)
-        except Exception:
-            persons = []
 
         # Build clip indices around keyframe once per keyframe.
         frame_indices = sample_frame_indices(
@@ -221,31 +231,70 @@ def run_behavior_pipeline_on_result(
             fps=fps,
             window_seconds=cfg.clip_seconds,
             num_frames=cfg.clip_num_frames,
+            max_frame=max_frame_index,
         )
 
-        # Read clip frames once per keyframe (major perf win vs per-student reads).
+        # Read frames using ffmpeg (faster) or fallback to OpenCV
         try:
-            frames_bgr = read_frames_by_index(cap, frame_indices)
-        except Exception:
-            logger.debug(f"behavior: failed to read clip around keyframe {fidx}", exc_info=True)
+            if use_ffmpeg and ffmpeg_reader:
+                # FFmpeg can read all frames efficiently in one shot
+                frames_bgr = ffmpeg_reader.read_frames(frame_indices)
+                if not frames_bgr or len(frames_bgr) == 0:
+                    logger.debug(f"behavior: ffmpeg returned no frames for keyframe {fidx}")
+                    continue
+                key_bgr = frames_bgr[len(frames_bgr) // 2]  # Use middle frame as keyframe
+            else:
+                # OpenCV fallback: seek + read
+                cap.set(cv2.CAP_PROP_POS_FRAMES, float(fidx))
+                ok, key_bgr = cap.read()
+                if not ok or key_bgr is None:
+                    logger.debug(f"behavior: failed to read keyframe {fidx}")
+                    continue
+                frames_bgr = read_frames_by_index(cap, frame_indices)
+        except Exception as e:
+            logger.debug(f"behavior: failed to read clip around keyframe {fidx}: {e}", exc_info=True)
             continue
 
-        student_items: List[Tuple[str, List[int]]] = []
-        student_clips: List = []
+        # Collect clips for all students in this keyframe
+        keyframe_items = []  # [(name, crop_bbox), ...]
+        keyframe_clips = []  # [clip_rgb, ...]
 
         for name, det in names_to_det.items():
             face_bbox = det.get("bbox")
             if not face_bbox:
                 continue
 
-            # Choose body bbox if available.
-            if not persons:
-                # Cannot attribute behavior without a person bbox.
-                continue
+            # Priority 1: Use body_bbox from JSON (v2 schema)
+            crop_bbox = det.get("body_bbox")
 
-            crop_bbox = pick_person_bbox_for_face(persons, face_bbox)
+            # Priority 2: If no body_bbox in JSON, try person detector (fallback)
+            if crop_bbox is None and person_detector is not None:
+                persons = []
+                try:
+                    persons = person_detector.detect_persons(key_bgr, conf=cfg.person_conf)
+                except Exception:
+                    persons = []
+
+                if persons:
+                    crop_bbox = pick_person_bbox_for_face(persons, face_bbox)
+
+            # Priority 3: If still no body bbox, use face bbox as fallback
             if crop_bbox is None:
-                continue
+                # Use face bbox expanded by 2x for body estimation
+                x1, y1, x2, y2 = face_bbox
+                h, w = key_bgr.shape[:2]
+                fw = x2 - x1
+                fh = y2 - y1
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                # Expand to roughly 2x width and 3x height to cover upper body
+                bw = fw * 2.0
+                bh = fh * 3.0
+                bx1 = max(0, int(cx - bw / 2))
+                by1 = max(0, int(y1 - fh * 0.2))  # Start slightly above face
+                bx2 = min(w, int(cx + bw / 2))
+                by2 = min(h, int(by1 + bh))
+                crop_bbox = [bx1, by1, bx2, by2]
 
             observed_frames.setdefault(name, set()).add(int(fidx))
 
@@ -254,50 +303,50 @@ def run_behavior_pipeline_on_result(
 
             try:
                 clip_rgb = crop_clip(frames_bgr, crop_bbox)
-            except Exception:
-                logger.debug("behavior: clip crop failed", exc_info=True)
+                keyframe_items.append((name, crop_bbox))
+                keyframe_clips.append(clip_rgb)
+            except Exception as e:
+                logger.debug(f"clip crop failed for {name} at frame {fidx}: {e}")
                 continue
 
-            student_items.append((name, crop_bbox))
-            student_clips.append(clip_rgb)
-
-        # Run action inference for this keyframe.
-        # No custom classroom-behavior mapping is applied: we directly use the
-        # pretrained category name as the behavior label.
-        if student_clips:
+        # Run action inference for this keyframe's clips
+        if keyframe_clips:
             try:
-                start = 0
-                while start < len(student_clips):
-                    end = min(len(student_clips), start + int(behavior_batch))
-                    batch = student_clips[start:end]
-                    _scores, tops = action_model.predict_proba(batch, topk=1)
-                    # batch call returns list[ActionTopK]
-                    for top, (name, _bbox) in zip(tops, student_items[start:end]):
-                        if getattr(top, "categories", None):
-                            label, _prob = top.categories[0]
-                            # Use a hard assignment score=1.0 for the selected label, so
-                            # segmentation reflects the model's predicted label sequence.
-                            per_student_scores.setdefault(name, {}).setdefault(str(label), {})[int(fidx)] = 1.0
-                            processed_tasks += 1
-                    start = end
-            except Exception:
-                logger.debug("behavior: action inference failed", exc_info=True)
+                # Batch inference on all clips from this keyframe
+                _scores, tops = action_model.predict_proba(keyframe_clips, topk=1)
 
-        # Progress log (behavior stage).
+                # tops should be a list of ActionTopK
+                if not isinstance(tops, list):
+                    tops = [tops]
+
+                # Match results with student names
+                for top, (name, _bbox) in zip(tops, keyframe_items):
+                    if getattr(top, "categories", None) and len(top.categories) > 0:
+                        label, _prob = top.categories[0]
+                        # Use a hard assignment score=1.0 for the selected label
+                        per_student_scores.setdefault(name, {}).setdefault(str(label), {})[int(fidx)] = 1.0
+                        processed_tasks += 1
+
+            except Exception as e:
+                logger.warning(f"behavior: action inference failed for keyframe {fidx}: {e}")
+
+        # Progress log
         try:
-            if total_tasks > 0 and (processed_tasks % progress_every == 0 or processed_tasks == total_tasks):
+            if processed_tasks % progress_every == 0 or processed_tasks == total_tasks:
                 elapsed = max(1e-6, time.time() - t0)
                 rate = float(processed_tasks) / elapsed
                 eta = float(total_tasks - processed_tasks) / rate if rate > 1e-9 else None
-                if eta is not None:
-                    logger.info(
-                        f"behavior进度: {processed_tasks}/{total_tasks} tasks ({processed_tasks * 100.0 / total_tasks:.1f}%), {rate:.2f} task/s, ETA: {eta:.1f}s"
-                    )
-                else:
-                    logger.info(f"behavior进度: {processed_tasks}/{total_tasks} tasks, {rate:.2f} task/s")
+
+                logger.info(
+                    f"behavior进度: {processed_tasks}/{total_tasks} ({processed_tasks * 100.0 / total_tasks:.1f}%), "
+                    f"{rate:.2f} task/s" + (f", ETA: {eta:.1f}s" if eta else "")
+                )
         except Exception:
             pass
 
+    # Cleanup
+    if ffmpeg_reader:
+        ffmpeg_reader.close()
     cap.release()
 
     # Compute video duration (optional)
