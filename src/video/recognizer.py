@@ -132,7 +132,93 @@ class VideoFaceRecognizer:
             "detections": detections,
         }
 
-    def _refresh_track_identities(self, tracker: SimpleTracker) -> None:
+    def _deduplicate_track_identities_per_frame(self, tracker: SimpleTracker, frame_idx: int) -> None:
+        """
+        同一帧内轨迹身份去重：避免同一个人被识别为多个轨迹。
+
+        采用贪心策略：
+        1. 收集该帧所有活跃轨迹的身份和相似度
+        2. 按相似度从高到低排序
+        3. 为相似度最高的轨迹保留其身份
+        4. 其他轨迹重新识别时排除已分配的身份
+        """
+        # 收集该帧的所有活跃轨迹
+        frame_tracks = []
+        for tid, info in tracker.tracks.items():
+            tracklet = info.get("tracklet")
+            if tracklet is None:
+                continue
+
+            # 检查该轨迹是否在该帧有检测
+            try:
+                dets = getattr(tracklet, "detections", []) or []
+                # 检查是否有该帧的检测
+                frame_has_det = any(det.get("frame_idx") == frame_idx for det in dets if isinstance(det, dict))
+                if not frame_has_det:
+                    continue
+            except Exception:
+                continue
+
+            identity = info.get("resolved_identity")
+            similarity = info.get("resolved_similarity", 0.0)
+
+            frame_tracks.append(
+                {
+                    "tid": tid,
+                    "identity": identity,
+                    "similarity": float(similarity) if similarity else 0.0,
+                    "info": info,
+                    "tracklet": tracklet,
+                }
+            )
+
+        if len(frame_tracks) <= 1:
+            return
+
+        # 按相似度从高到低排序
+        frame_tracks.sort(key=lambda x: x["similarity"], reverse=True)
+
+        # 贪心去重
+        assigned_identities = set()
+
+        for track_info in frame_tracks:
+            tid = track_info["tid"]
+            identity = track_info["identity"]
+            similarity = track_info["similarity"]
+            info = track_info["info"]
+            tracklet = track_info["tracklet"]
+
+            # 如果该身份尚未被分配，保留
+            if identity == "未知" or identity not in assigned_identities:
+                assigned_identities.add(identity)
+            else:
+                # 该身份已被分配，需要重新识别
+                try:
+                    agg = getattr(tracklet, "agg_embedding", None)
+                    if agg is not None:
+                        if getattr(tracklet, "qualities", None):
+                            q = float(np.mean(np.asarray(tracklet.qualities, dtype=np.float32)))
+                        else:
+                            q = 0.5
+
+                        # 重新识别，排除已分配的身份
+                        exclude_list = list(assigned_identities)
+                        new_identity, new_sim = self.recognizer.recognize_identity(
+                            agg, q, debug=False, exclude_identities=exclude_list
+                        )
+
+                        info["resolved_identity"] = new_identity
+                        info["resolved_similarity"] = float(new_sim)
+                        assigned_identities.add(new_identity)
+
+                        logger.info(
+                            f"轨迹 {tid} 帧{frame_idx}: 原识别为 {identity}（已被分配），"
+                            f"重新识别为 {new_identity} (相似度: {new_sim:.4f})"
+                        )
+                except Exception as e:
+                    logger.debug(f"轨迹 {tid} 重新识别失败: {e}")
+
+    def _refresh_track_identities(self, tracker: SimpleTracker, frame_idx: Optional[int] = None) -> None:
         """Re-identify tracks using aggregated embeddings for multi-frame reinforcement."""
         for tid, info in tracker.tracks.items():
             t = info.get("tracklet")
@@ -154,6 +240,10 @@ class VideoFaceRecognizer:
                 identity, sim = "未知", 0.0
             info["resolved_identity"] = identity
             info["resolved_similarity"] = float(sim)
+
+        # 同一帧内轨迹去重
+        if frame_idx is not None:
+            self._deduplicate_track_identities_per_frame(tracker, frame_idx)
 
     def _apply_identity_hysteresis(
         self,
@@ -949,7 +1039,7 @@ class VideoFaceRecognizer:
                     tracker.update(detections_raw, global_idx, body_bboxes=body_bboxes_for_tracker)
 
                     try:
-                        self._refresh_track_identities(tracker)
+                        self._refresh_track_identities(tracker, frame_idx=global_idx)
                         self._apply_identity_hysteresis(
                             tracker,
                             lock_threshold=float(lock_threshold),
@@ -1075,7 +1165,7 @@ class VideoFaceRecognizer:
                     tracker.update(detections_raw, global_idx)
 
                     try:
-                        self._refresh_track_identities(tracker)
+                        self._refresh_track_identities(tracker, frame_idx=global_idx)
                         self._apply_identity_hysteresis(
                             tracker,
                             lock_threshold=float(lock_threshold),

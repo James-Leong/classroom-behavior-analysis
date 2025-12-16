@@ -1447,16 +1447,66 @@ class FaceRecognizer:
 
         recognition_results = []
 
+        # 第一步：对所有人脸进行初步识别，获取 (face_idx, quality, identity, similarity) 的列表
+        face_recognitions = []
         for i, face in enumerate(faces):
-            # 评估质量
             quality = self.assess_face_quality(face, image.shape)
+            identity, similarity = self.recognize_identity(face.embedding, quality)
+            face_recognitions.append(
+                {
+                    "idx": i,
+                    "face": face,
+                    "quality": quality,
+                    "identity": identity,
+                    "similarity": similarity,
+                }
+            )
+
+        # 第二步：按相似度从高到低排序
+        face_recognitions.sort(key=lambda x: x["similarity"], reverse=True)
+
+        # 第三步：处理身份去重
+        # 维护已分配的身份集合，对于重复的身份，重新识别时排除已分配的身份
+        assigned_identities = set()
+        final_results = []
+
+        for rec in face_recognitions:
+            identity = rec["identity"]
+            similarity = rec["similarity"]
+
+            # 如果该身份尚未被分配，就保留
+            if identity == "未知" or identity not in assigned_identities:
+                assigned_identities.add(identity)
+                final_results.append(rec)
+            else:
+                # 该身份已被分配给置信度更高的人脸，需要重新识别
+                # 排除已分配的身份，在剩余候选中重新识别
+                exclude_list = list(assigned_identities)
+                new_identity, new_similarity = self.recognize_identity(
+                    rec["face"].embedding, rec["quality"], exclude_identities=exclude_list
+                )
+                assigned_identities.add(new_identity)
+                rec["identity"] = new_identity
+                rec["similarity"] = new_similarity
+                final_results.append(rec)
+                logger.info(
+                    f"人脸 {rec['idx']}: 原识别为 {identity}（已被分配），"
+                    f"重新识别为 {new_identity} (相似度: {new_similarity:.4f})"
+                )
+
+        # 第四步：按原始顺序（face 在图像中的顺序）重新排列结果，然后生成输出
+        final_results.sort(key=lambda x: x["idx"])
+
+        for rec in final_results:
+            i = rec["idx"]
+            face = rec["face"]
+            quality = rec["quality"]
+            identity = rec["identity"]
+            similarity = rec["similarity"]
 
             # 获取人脸框
             bbox = face.bbox.astype(int)
             x1, y1, x2, y2 = bbox
-
-            # 识别身份
-            identity, similarity = self.recognize_identity(face.embedding, quality)
 
             # 准备结果
             result = {
@@ -1484,7 +1534,12 @@ class FaceRecognizer:
         return result_image, recognition_results
 
     def recognize_identity(
-        self, embedding: np.ndarray, quality: float, debug: bool = False, topk: int = 5
+        self,
+        embedding: np.ndarray,
+        quality: float,
+        debug: bool = False,
+        topk: int = 5,
+        exclude_identities: Optional[List[str]] = None,
     ) -> Tuple[str, float]:
         """
         身份识别，考虑质量因素
@@ -1492,6 +1547,9 @@ class FaceRecognizer:
         Args:
             embedding: 人脸embedding
             quality: 人脸质量分数
+            debug: 调试模式
+            topk: 返回topk结果的个数
+            exclude_identities: 要排除的身份列表（用于处理同一帧内的身份去重）
 
         Returns:
             (身份, 相似度)
@@ -1504,9 +1562,20 @@ class FaceRecognizer:
 
         emb = l2_normalize(np.asarray(embedding, dtype=np.float32))
 
+        # 如果提供了排除列表，则创建临时的 gallery（只包含未被排除的身份）
+        if exclude_identities is not None and exclude_identities:
+            exclude_set = set(exclude_identities)
+            filtered_gallery = {k: v for k, v in self._gallery.person_to_embeddings.items() if k not in exclude_set}
+            if not filtered_gallery:
+                # 如果所有身份都被排除，返回"未知"
+                return "未知", 0.0
+            gallery_to_match = filtered_gallery
+        else:
+            gallery_to_match = self._gallery.person_to_embeddings
+
         identity, sim, topk_list = self._matcher.match(
             emb,
-            self._gallery.person_to_embeddings,
+            gallery_to_match,
             quality=float(quality),
             topk_debug=int(topk),
         )
