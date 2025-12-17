@@ -47,24 +47,43 @@ class CLIPVideoActionModel:
             >>> scores, top = model.predict_proba(clip, topk=3)
     """
 
-    # Default classroom behavior descriptions (English)
-    # Simplified to 5 robust categories for better accuracy with small faces in surveillance video
-    DEFAULT_BEHAVIORS = [
-        "a student sitting and looking straight ahead at the front of classroom, attentive and listening",
-        "a student reading a textbook or writing notes with pen, focused on paper or book",
-        "a student looking at and interacting with computer keyboard or smartphone screen, hands visible with device",
-        "a student looking around in different directions with head turning, not focused, distracted",
-        "other activity or unclear action not matching specific behaviors",
-    ]
+    # Default labels (kept stable for downstream compatibility)
+    DEFAULT_LABELS = ["listening", "reading_or_writing", "using_device", "distracted", "other"]
 
-    # Short labels for output (matched to behaviors)
-    DEFAULT_LABELS = [
-        "listening",
-        "reading_or_writing",
-        "using_device",
-        "distracted",
-        "other",
-    ]
+    # Multi-prompt templates per label.
+    # Rationale: classroom surveillance is low-res; multiple prompts reduce prompt brittleness and
+    # help separate "listening_upright" vs "head_down" vs "looking_around".
+    DEFAULT_PROMPTS_BY_LABEL: Dict[str, List[str]] = {
+        "listening": [
+            "a student sitting upright at a desk, looking forward to the front of the classroom, attentive and listening",
+            "a student sitting straight, eyes looking forward, paying attention to the teacher",
+            "a student looking straight ahead, not looking down at a book, not using a phone",
+        ],
+        "reading_or_writing": [
+            "a student with head down, reading a textbook or writing notes on paper at a desk",
+            "a student looking down at notebook or book, writing with a pen",
+            "a student focused on paper or book on the desk, taking notes",
+        ],
+        "using_device": [
+            "a student using a smartphone or looking at a phone screen at a desk",
+            "a student typing on a computer keyboard or using a laptop",
+            "a student looking down at a device screen, hands interacting with a phone",
+        ],
+        "distracted": [
+            "a student looking around in different directions, head turning left and right, distracted",
+            "a student not paying attention, looking sideways or away from the desk and teacher",
+            "a student chatting with others or looking elsewhere instead of studying",
+        ],
+        "other": [
+            "other activity or unclear action in a classroom",
+            "unclear behavior, cannot tell what the student is doing",
+        ],
+    }
+
+    # Backward compatible single-prompt list (legacy)
+    DEFAULT_BEHAVIORS: List[str] = []
+    for _lbl in DEFAULT_LABELS:
+        DEFAULT_BEHAVIORS.append(DEFAULT_PROMPTS_BY_LABEL[_lbl][0])
 
     def __init__(
         self,
@@ -72,6 +91,7 @@ class CLIPVideoActionModel:
         device: str = "auto",
         custom_behaviors: Optional[List[str]] = None,
         custom_labels: Optional[List[str]] = None,
+        temperature: float = 100.0,
     ) -> None:
         """Initialize CLIP model.
 
@@ -83,6 +103,7 @@ class CLIPVideoActionModel:
             custom_labels: Custom short labels (must match behaviors length)
         """
         self.model_name = str(model_name)
+        self.temperature = float(temperature)
 
         # Device setup
         dev = str(device).strip().lower()
@@ -105,24 +126,59 @@ class CLIPVideoActionModel:
         self.model.eval()
 
         # Setup behavior categories
-        self.behaviors = custom_behaviors or self.DEFAULT_BEHAVIORS
-        if custom_labels:
-            if len(custom_labels) != len(self.behaviors):
-                raise ValueError(
-                    f"custom_labels length ({len(custom_labels)}) must match behaviors ({len(self.behaviors)})"
-                )
-            self.labels = custom_labels
+        if custom_behaviors is not None:
+            self.behaviors = list(custom_behaviors)
+            if custom_labels:
+                if len(custom_labels) != len(self.behaviors):
+                    raise ValueError(
+                        f"custom_labels length ({len(custom_labels)}) must match behaviors ({len(self.behaviors)})"
+                    )
+                self.labels = list(custom_labels)
+            else:
+                self.labels = self.DEFAULT_LABELS[: len(self.behaviors)]
+
+            logger.info(f"Encoding {len(self.behaviors)} behavior descriptions")
+            with torch.no_grad():
+                text_inputs = clip.tokenize(self.behaviors).to(self.device)
+                text_features = self.model.encode_text(text_inputs)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                self.text_features = text_features
         else:
-            self.labels = self.DEFAULT_LABELS[: len(self.behaviors)]
+            # Default: multi-prompt per label, averaged.
+            self.labels = list(self.DEFAULT_LABELS)
+            prompts_by_label = {k: list(v) for k, v in self.DEFAULT_PROMPTS_BY_LABEL.items() if k in self.labels}
+            all_prompts: List[str] = []
+            counts: List[int] = []
+            for lbl in self.labels:
+                ps = prompts_by_label.get(lbl) or [lbl]
+                all_prompts.extend(ps)
+                counts.append(len(ps))
 
-        # Pre-encode all text descriptions (only once)
-        logger.info(f"Encoding {len(self.behaviors)} behavior descriptions")
-        with torch.no_grad():
-            text_inputs = clip.tokenize(self.behaviors).to(self.device)
-            self.text_features = self.model.encode_text(text_inputs)
-            self.text_features /= self.text_features.norm(dim=-1, keepdim=True)
+            logger.info(
+                "Encoding CLIP prompts: "
+                + ", ".join(f"{lbl}x{cnt}" for lbl, cnt in zip(self.labels, counts))
+                + f" (temperature={self.temperature:.1f})"
+            )
+            with torch.no_grad():
+                text_inputs = clip.tokenize(all_prompts).to(self.device)
+                prompt_features = self.model.encode_text(text_inputs)
+                prompt_features = prompt_features / prompt_features.norm(dim=-1, keepdim=True)
 
-        logger.info(f"CLIP model ready with {len(self.behaviors)} behaviors")
+                # Average prompts per label
+                feats: List[torch.Tensor] = []
+                offset = 0
+                for cnt in counts:
+                    f = prompt_features[offset : offset + cnt].mean(dim=0, keepdim=True)
+                    f = f / f.norm(dim=-1, keepdim=True)
+                    feats.append(f)
+                    offset += cnt
+
+                self.text_features = torch.cat(feats, dim=0)  # (N_labels, D)
+
+            # For logging/backward introspection only
+            self.behaviors = [prompts_by_label[lbl][0] for lbl in self.labels]
+
+        logger.info(f"CLIP model ready with {len(self.labels)} labels")
 
     def _preprocess_frames_batch(self, frames: np.ndarray) -> torch.Tensor:
         """Preprocess frames batch directly without PIL conversion (GPU-optimized).
@@ -133,7 +189,6 @@ class CLIPVideoActionModel:
         Returns:
             Preprocessed tensor (T, 3, 224, 224) ready for CLIP
         """
-        import torchvision.transforms.functional as F
 
         # Convert to torch tensor and move to GPU immediately: (T, H, W, 3) -> (T, 3, H, W)
         batch = torch.from_numpy(frames).permute(0, 3, 1, 2).to(self.device).float()
@@ -194,7 +249,7 @@ class CLIPVideoActionModel:
         video_features = video_features / video_features.norm(dim=-1, keepdim=True)
 
         # 3. Compute similarity with all behavior texts
-        similarity = (100.0 * video_features @ self.text_features.T).softmax(dim=-1)
+        similarity = (float(self.temperature) * video_features @ self.text_features.T).softmax(dim=-1)
         probs = similarity.squeeze(0).cpu().numpy()  # (N_behaviors,)
 
         # 4. Build output
@@ -266,7 +321,9 @@ class CLIPVideoActionModel:
 
         # 5. 批量计算所有video features与text features的相似度
         video_features_batch = torch.cat(video_features_list, dim=0)  # (B, D)
-        similarity = (100.0 * video_features_batch @ self.text_features.T).softmax(dim=-1)  # (B, N_behaviors)
+        similarity = (float(self.temperature) * video_features_batch @ self.text_features.T).softmax(
+            dim=-1
+        )  # (B, N_behaviors)
         probs_batch = similarity.cpu().numpy()  # (B, N_behaviors)
 
         # 6. 构建输出

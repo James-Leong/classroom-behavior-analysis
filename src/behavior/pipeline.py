@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 
 import cv2
 
@@ -34,6 +34,7 @@ class BehaviorPipelineConfig:
     clip_model_name: str = "ViT-B/32"  # ViT-B/32, ViT-B/16, ViT-L/14
     clip_custom_behaviors: Optional[List[str]] = None
     clip_custom_labels: Optional[List[str]] = None
+    clip_temperature: float = 40.0
 
     # Device: reuse top-level --device (auto/cpu/gpu). Internally maps gpu->cuda.
     device: str = "auto"
@@ -48,6 +49,21 @@ class BehaviorPipelineConfig:
 
     # Segmentation
     series_cfg: BehaviorSeriesConfig = field(default_factory=BehaviorSeriesConfig)
+
+    # Temporal smoothing / uncertainty gating (primarily for CLIP)
+    enable_smoothing: bool = True
+    smoothing_alpha: float = 0.80  # EMA: higher -> smoother
+    uncertain_min_prob: float = 0.0  # 0 disables prob gating
+    uncertain_min_margin: float = 0.0  # 0 disables margin gating
+    uncertain_fallback_label: str = "other"  # used when gating triggers and label exists
+
+    # Make it harder to enter distracted (reduce false positives)
+    distracted_enter_min_prob: float = 0.0  # 0 disables
+    distracted_enter_min_margin: float = 0.25  # 0 disables
+
+    # Make it harder to stay distracted (avoid sticky false positives)
+    distracted_stay_min_prob: float = 0.0  # 0 disables
+    distracted_stay_min_margin: float = 0.20  # 0 disables
 
     # Lock status filtering (v2 feature)
     ignore_lock_status: bool = False  # If True, analyze all detections regardless of lock status
@@ -162,6 +178,7 @@ def run_behavior_pipeline_on_result(
             device=dev,
             custom_behaviors=cfg.clip_custom_behaviors,
             custom_labels=cfg.clip_custom_labels,
+            temperature=float(cfg.clip_temperature),
         )
     else:
         logger.info(f"Using Kinetics pretrained model: {cfg.action_model_name}")
@@ -205,6 +222,10 @@ def run_behavior_pipeline_on_result(
             logger.info(f"Video has {max_frame_index} frames (from OpenCV)")
 
     per_student_scores: Dict[str, Dict[str, Dict[int, float]]] = {}
+
+    # Per-student EMA state for smoothing label decisions.
+    # name -> label -> ema_score
+    ema_state: Dict[str, Dict[str, float]] = {}
 
     # Progress
     total_tasks = 0
@@ -286,7 +307,7 @@ def run_behavior_pipeline_on_result(
                 fw = x2 - x1
                 fh = y2 - y1
                 cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
+                # cy = (y1 + y2) / 2
                 # Expand to roughly 2x width and 3x height to cover upper body
                 bw = fw * 2.0
                 bh = fh * 3.0
@@ -313,18 +334,126 @@ def run_behavior_pipeline_on_result(
         if keyframe_clips:
             try:
                 # Batch inference on all clips from this keyframe
-                _scores, tops = action_model.predict_proba(keyframe_clips, topk=1)
+                scores_list, tops = action_model.predict_proba(keyframe_clips, topk=3)
+
+                # Normalize batch return shape
+                if isinstance(scores_list, dict):
+                    scores_list = [scores_list]
 
                 # tops should be a list of ActionTopK
                 if not isinstance(tops, list):
                     tops = [tops]
 
                 # Match results with student names
-                for top, (name, _bbox) in zip(tops, keyframe_items):
-                    if getattr(top, "categories", None) and len(top.categories) > 0:
-                        label, _prob = top.categories[0]
-                        # Use a hard assignment score=1.0 for the selected label
-                        per_student_scores.setdefault(name, {}).setdefault(str(label), {})[int(fidx)] = 1.0
+                alpha = float(cfg.smoothing_alpha)
+                if alpha < 0.0:
+                    alpha = 0.0
+                if alpha > 0.99:
+                    alpha = 0.99
+
+                do_smooth = bool(cfg.enable_smoothing) and isinstance(action_model, CLIPVideoActionModel)
+                min_prob = float(cfg.uncertain_min_prob)
+                min_margin = float(cfg.uncertain_min_margin)
+                fallback_label = str(cfg.uncertain_fallback_label or "").strip()
+                distracted_enter_min_prob = float(cfg.distracted_enter_min_prob)
+                distracted_enter_min_margin = float(cfg.distracted_enter_min_margin)
+                distracted_stay_min_prob = float(cfg.distracted_stay_min_prob)
+                distracted_stay_min_margin = float(cfg.distracted_stay_min_margin)
+
+                def _pick_conservative_label(score_map: Dict[str, float]) -> str:
+                    # When we are uncertain and have no history, avoid collapsing into
+                    # 'distracted' (most costly false positive) and 'other'.
+                    avoid = {"distracted", "other"}
+                    items2 = sorted(score_map.items(), key=lambda kv: float(kv[1]), reverse=True)
+                    for lbl2, _v2 in items2:
+                        if str(lbl2) not in avoid:
+                            return str(lbl2)
+                    return str(items2[0][0]) if items2 else ""
+
+                for scores, (name, _bbox) in zip(scores_list, keyframe_items):
+                    if not isinstance(scores, dict) or not scores:
+                        continue
+
+                    # Convert to dense float map
+                    cur_scores: Dict[str, float] = {str(k): float(v) for k, v in scores.items()}
+
+                    # Uncertainty gating based on current scores
+                    try:
+                        items = sorted(cur_scores.items(), key=lambda kv: float(kv[1]), reverse=True)
+                        top1_label, top1_prob = items[0]
+                        top2_prob = float(items[1][1]) if len(items) >= 2 else 0.0
+                        margin = float(top1_prob) - float(top2_prob)
+                    except Exception:
+                        top1_label, top1_prob, margin = "", 0.0, 0.0
+
+                    gated = False
+                    if min_prob > 0.0 and float(top1_prob) < min_prob:
+                        gated = True
+                    if min_margin > 0.0 and float(margin) < min_margin:
+                        gated = True
+
+                    # EMA smoothing (CLIP only): smooth the score vector, then take argmax.
+                    if do_smooth:
+                        st = ema_state.setdefault(name, {})
+
+                        # Stricter rule to enter distracted (optional): if current top-1 is
+                        # distracted but we weren't previously, require stronger evidence.
+                        had_history = bool(st)
+                        prev_lbl = max(st.items(), key=lambda kv: float(kv[1]))[0] if had_history else ""
+                        if (
+                            str(top1_label) == "distracted"
+                            and str(prev_lbl) != "distracted"
+                            and (distracted_enter_min_prob > 0.0 or distracted_enter_min_margin > 0.0)
+                        ):
+                            if distracted_enter_min_prob > 0.0 and float(top1_prob) < distracted_enter_min_prob:
+                                gated = True
+                            if distracted_enter_min_margin > 0.0 and float(margin) < distracted_enter_min_margin:
+                                gated = True
+
+                        # Always update EMA state to build history.
+                        for lbl, v in cur_scores.items():
+                            prev = float(st.get(lbl, v))
+                            st[lbl] = prev * alpha + float(v) * (1.0 - alpha)
+                        # Keep only labels that are still present to avoid unbounded growth.
+                        for lbl in list(st.keys()):
+                            if lbl not in cur_scores:
+                                st.pop(lbl, None)
+
+                        if gated:
+                            if had_history and prev_lbl:
+                                # Hold previous stable decision when uncertain.
+                                chosen_label = str(prev_lbl)
+                            else:
+                                chosen_label = _pick_conservative_label(cur_scores)
+                        else:
+                            chosen_label = max(st.items(), key=lambda kv: float(kv[1]))[0] if st else top1_label
+
+                        # Additional rule: if we were previously distracted but current evidence for
+                        # distracted is weak, force-exit to a non-distracted conservative label.
+                        if str(prev_lbl) == "distracted" and (
+                            distracted_stay_min_prob > 0.0 or distracted_stay_min_margin > 0.0
+                        ):
+                            # Evidence for staying distracted is based on current top-1 being distracted
+                            # and meeting prob/margin thresholds.
+                            enough = True
+                            if str(top1_label) != "distracted":
+                                enough = False
+                            if distracted_stay_min_prob > 0.0 and float(top1_prob) < distracted_stay_min_prob:
+                                enough = False
+                            if distracted_stay_min_margin > 0.0 and float(margin) < distracted_stay_min_margin:
+                                enough = False
+                            if not enough:
+                                chosen_label = _pick_conservative_label(cur_scores)
+                    else:
+                        # No smoothing: optional fallback label when uncertain.
+                        if gated and fallback_label and fallback_label in cur_scores:
+                            chosen_label = fallback_label
+                        else:
+                            chosen_label = top1_label
+
+                    if chosen_label:
+                        # Hard assignment per frame, but decision is smoothed.
+                        per_student_scores.setdefault(name, {}).setdefault(str(chosen_label), {})[int(fidx)] = 1.0
                         processed_tasks += 1
 
             except Exception as e:

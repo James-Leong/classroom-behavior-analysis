@@ -39,9 +39,8 @@ pip install -r requirements.txt
 ### 人脸识别
 
 ```bash
-python video_recognizer.py data/video/20251115_clip.mp4 \
-    --output-video outputs/tracklet_20251115_clip.mp4 \
-    --output-json outputs/face_results.json \
+python video_recognizer.py data/video/20251115_1h.mp4 \
+    --output-json outputs/face_results_1h.json \
     --gallery data/id_photo \
     --interval-frames 10 \
     --enable-person-detection

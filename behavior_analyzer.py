@@ -146,6 +146,12 @@ def main() -> None:
         help="CLIP模型选择（仅当model-type=clip时有效）: ViT-B/32(快), ViT-B/16(平衡), ViT-L/14(准)",
     )
     parser.add_argument(
+        "--clip-temperature",
+        type=float,
+        default=40.0,
+        help="CLIP softmax temperature（越大分布越尖锐，默认 40.0）",
+    )
+    parser.add_argument(
         "--clip-seconds",
         type=float,
         default=4,
@@ -193,6 +199,70 @@ def main() -> None:
         help="同类行为段合并间隙（秒，默认: 0.30）",
     )
 
+    # 时序平滑/不确定性门控（主要用于 CLIP）
+    parser.add_argument(
+        "--smooth",
+        action="store_true",
+        default=True,
+        help="启用行为时序平滑（默认启用；主要用于 CLIP）",
+    )
+    parser.add_argument(
+        "--no-smooth",
+        dest="smooth",
+        action="store_false",
+        help="禁用行为时序平滑",
+    )
+    parser.add_argument(
+        "--smooth-alpha",
+        type=float,
+        default=0.80,
+        help="EMA 平滑系数 alpha（越大越平滑，默认 0.80）",
+    )
+    parser.add_argument(
+        "--uncertain-min-prob",
+        type=float,
+        default=0.0,
+        help="不确定性门控：top1 概率低于该值则回退（0 表示禁用，默认 0）",
+    )
+    parser.add_argument(
+        "--uncertain-min-margin",
+        type=float,
+        default=0.0,
+        help="不确定性门控：top1-top2 边际低于该值则回退（0 表示禁用，默认 0）",
+    )
+    parser.add_argument(
+        "--uncertain-fallback-label",
+        type=str,
+        default="other",
+        help="不确定性门控触发时回退到的标签（需存在于模型标签中，默认 other）",
+    )
+
+    parser.add_argument(
+        "--distracted-enter-min-prob",
+        type=float,
+        default=0.0,
+        help="更严格进入 distracted：当从非distracted切换到distracted时要求 top1_prob ≥ 该值（0 表示禁用）",
+    )
+    parser.add_argument(
+        "--distracted-enter-min-margin",
+        type=float,
+        default=0.25,
+        help="更严格进入 distracted：当从非distracted切换到distracted时要求 margin ≥ 该值（0 表示禁用）",
+    )
+
+    parser.add_argument(
+        "--distracted-stay-min-prob",
+        type=float,
+        default=0.0,
+        help="更严格保持 distracted：上一状态为distracted时，要求 top1_prob ≥ 该值，否则强制退出（0 表示禁用）",
+    )
+    parser.add_argument(
+        "--distracted-stay-min-margin",
+        type=float,
+        default=0.20,
+        help="更严格保持 distracted：上一状态为distracted时，要求 margin ≥ 该值，否则强制退出（0 表示禁用）",
+    )
+
     args = parser.parse_args()
 
     # 加载人脸识别结果
@@ -220,6 +290,7 @@ def main() -> None:
         model_type=str(args.model_type),
         action_model_name=str(args.kinetics_model),
         clip_model_name=str(args.clip_model),
+        clip_temperature=float(args.clip_temperature),
         device=str(args.device),
         clip_seconds=float(args.clip_seconds),
         clip_num_frames=int(args.clip_frames),
@@ -232,6 +303,15 @@ def main() -> None:
             merge_gap_seconds=float(args.merge_gap),
         ),
         ignore_lock_status=bool(args.ignore_lock_status),
+        enable_smoothing=bool(args.smooth),
+        smoothing_alpha=float(args.smooth_alpha),
+        uncertain_min_prob=float(args.uncertain_min_prob),
+        uncertain_min_margin=float(args.uncertain_min_margin),
+        uncertain_fallback_label=str(args.uncertain_fallback_label),
+        distracted_enter_min_prob=float(args.distracted_enter_min_prob),
+        distracted_enter_min_margin=float(args.distracted_enter_min_margin),
+        distracted_stay_min_prob=float(args.distracted_stay_min_prob),
+        distracted_stay_min_margin=float(args.distracted_stay_min_margin),
     )
 
     logger.info("=" * 60)
