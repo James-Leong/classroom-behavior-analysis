@@ -62,7 +62,8 @@ python behavior_analyzer.py \
 
 ## 📚 文档
 
-- []() -
+- [开发环境指南](./docs/DEV_ENVIRONMENT.md) - 根据不同的设备，配置开发环境的说明
+- [CLIP使用指南](./docs/CLIP_USAGE.md) - 如何使用CLIP模型进行行为识别
 
 ## 模型下载
 
