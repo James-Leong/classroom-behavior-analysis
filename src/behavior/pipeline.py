@@ -240,109 +240,171 @@ def run_behavior_pipeline_on_result(
     except Exception:
         pass
 
-    # Iterate sampled frames in order.
+    # Iterate sampled frames in batches to optimize I/O and GPU usage.
     sorted_keys = sorted(selected.keys())
 
-    for idx, fidx in enumerate(sorted_keys):
-        names_to_det = selected[fidx]
+    # Configurable batch size (in seconds of video time)
+    # 10s window balances memory usage vs I/O efficiency
+    BATCH_WINDOW_SECONDS = 10.0
 
-        # Build clip indices around keyframe once per keyframe.
-        frame_indices = sample_frame_indices(
-            center_frame=fidx,
-            fps=fps,
-            window_seconds=cfg.clip_seconds,
-            num_frames=cfg.clip_num_frames,
-            max_frame=max_frame_index,
-        )
+    batches = []
+    if sorted_keys:
+        current_batch = []
+        batch_start_t = sorted_keys[0] / fps
+        for fidx in sorted_keys:
+            t = fidx / fps
+            if t - batch_start_t > BATCH_WINDOW_SECONDS:
+                batches.append(current_batch)
+                current_batch = []
+                batch_start_t = t
+            current_batch.append(fidx)
+        if current_batch:
+            batches.append(current_batch)
 
-        # Read frames using ffmpeg (faster) or fallback to OpenCV
-        try:
-            if use_ffmpeg and ffmpeg_reader:
-                # FFmpeg can read all frames efficiently in one shot
-                frames_bgr = ffmpeg_reader.read_frames(frame_indices)
-                if not frames_bgr or len(frames_bgr) == 0:
-                    logger.debug(f"behavior: ffmpeg returned no frames for keyframe {fidx}")
-                    continue
-                key_bgr = frames_bgr[len(frames_bgr) // 2]  # Use middle frame as keyframe
-            else:
-                # OpenCV fallback: seek + read
-                cap.set(cv2.CAP_PROP_POS_FRAMES, float(fidx))
-                ok, key_bgr = cap.read()
-                if not ok or key_bgr is None:
-                    logger.debug(f"behavior: failed to read keyframe {fidx}")
-                    continue
-                frames_bgr = read_frames_by_index(cap, frame_indices)
-        except Exception as e:
-            logger.debug(f"behavior: failed to read clip around keyframe {fidx}: {e}", exc_info=True)
+    logger.info(
+        f"behavior: processing {len(sorted_keys)} keyframes in {len(batches)} batches (window={BATCH_WINDOW_SECONDS}s)"
+    )
+
+    for batch_idx, batch_keys in enumerate(batches):
+        # 1. Determine frame range needed for this batch
+        batch_needed_indices = set()
+        keyframe_indices_map = {}  # fidx -> indices
+
+        for fidx in batch_keys:
+            indices = sample_frame_indices(
+                center_frame=fidx,
+                fps=fps,
+                window_seconds=cfg.clip_seconds,
+                num_frames=cfg.clip_num_frames,
+                max_frame=max_frame_index,
+            )
+            keyframe_indices_map[fidx] = indices
+            batch_needed_indices.update(indices)
+
+        if not batch_needed_indices:
             continue
 
-        # Collect clips for all students in this keyframe
-        keyframe_items = []  # [(name, crop_bbox), ...]
-        keyframe_clips = []  # [clip_rgb, ...]
+        min_frame = min(batch_needed_indices)
+        max_frame = max(batch_needed_indices)
+        num_frames_to_read = max_frame - min_frame + 1
 
-        for name, det in names_to_det.items():
-            face_bbox = det.get("bbox")
-            if not face_bbox:
+        # 2. Read frames into memory buffer
+        buffer_frames = {}  # absolute_idx -> frame
+
+        try:
+            if use_ffmpeg and ffmpeg_reader:
+                # Read contiguous chunk using ffmpeg seeking
+                chunk = ffmpeg_reader.read_frame_range(min_frame, num_frames_to_read)
+                for i, frame in enumerate(chunk):
+                    buffer_frames[min_frame + i] = frame
+            else:
+                # Fallback OpenCV: seek and read range
+                cap.set(cv2.CAP_PROP_POS_FRAMES, float(min_frame))
+                for i in range(num_frames_to_read):
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        break
+                    buffer_frames[min_frame + i] = frame
+        except Exception as e:
+            logger.warning(f"Batch read failed at batch {batch_idx}: {e}")
+            continue
+
+        # 3. Prepare clips for batch inference
+        batch_clips = []
+        batch_meta = []  # (name, fidx)
+
+        for fidx in batch_keys:
+            indices = keyframe_indices_map[fidx]
+            names_to_det = selected[fidx]
+
+            # Ensure we have the keyframe for detection/cropping
+            if fidx not in buffer_frames:
                 continue
+            key_bgr = buffer_frames[fidx]
 
-            # Priority 1: Use body_bbox from JSON (v2 schema)
-            crop_bbox = det.get("body_bbox")
+            # Gather clip frames
+            clip_bgr = []
+            for idx in indices:
+                if idx in buffer_frames:
+                    clip_bgr.append(buffer_frames[idx])
+                else:
+                    # Pad with keyframe if missing (e.g. EOF)
+                    clip_bgr.append(key_bgr)
 
-            # Priority 2: If no body_bbox in JSON, try person detector (fallback)
-            if crop_bbox is None and person_detector is not None:
-                persons = []
-                try:
-                    persons = person_detector.detect_persons(key_bgr, conf=cfg.person_conf)
-                except Exception:
+            for name, det in names_to_det.items():
+                face_bbox = det.get("bbox")
+                if not face_bbox:
+                    continue
+
+                # Priority 1: Use body_bbox from JSON (v2 schema)
+                crop_bbox = det.get("body_bbox")
+
+                # Priority 2: If no body_bbox in JSON, try person detector (fallback)
+                if crop_bbox is None and person_detector is not None:
                     persons = []
+                    try:
+                        persons = person_detector.detect_persons(key_bgr, conf=cfg.person_conf)
+                    except Exception:
+                        persons = []
 
-                if persons:
-                    crop_bbox = pick_person_bbox_for_face(persons, face_bbox)
+                    if persons:
+                        crop_bbox = pick_person_bbox_for_face(persons, face_bbox)
 
-            # Priority 3: If still no body bbox, use face bbox as fallback
-            if crop_bbox is None:
-                # Use face bbox expanded by 2x for body estimation
-                x1, y1, x2, y2 = face_bbox
-                h, w = key_bgr.shape[:2]
-                fw = x2 - x1
-                fh = y2 - y1
-                cx = (x1 + x2) / 2
-                # cy = (y1 + y2) / 2
-                # Expand to roughly 2x width and 3x height to cover upper body
-                bw = fw * 2.0
-                bh = fh * 3.0
-                bx1 = max(0, int(cx - bw / 2))
-                by1 = max(0, int(y1 - fh * 0.2))  # Start slightly above face
-                bx2 = min(w, int(cx + bw / 2))
-                by2 = min(h, int(by1 + bh))
-                crop_bbox = [bx1, by1, bx2, by2]
+                # Priority 3: If still no body bbox, use face bbox as fallback
+                if crop_bbox is None:
+                    # Use face bbox expanded by 2x for body estimation
+                    x1, y1, x2, y2 = face_bbox
+                    h, w = key_bgr.shape[:2]
+                    fw = x2 - x1
+                    fh = y2 - y1
+                    cx = (x1 + x2) / 2
+                    # Expand to roughly 2x width and 3x height to cover upper body
+                    bw = fw * 2.0
+                    bh = fh * 3.0
+                    bx1 = max(0, int(cx - bw / 2))
+                    by1 = max(0, int(y1 - fh * 0.2))  # Start slightly above face
+                    bx2 = min(w, int(cx + bw / 2))
+                    by2 = min(h, int(by1 + bh))
+                    crop_bbox = [bx1, by1, bx2, by2]
 
-            observed_frames.setdefault(name, set()).add(int(fidx))
+                observed_frames.setdefault(name, set()).add(int(fidx))
+                per_student_scores.setdefault(name, {})
 
-            # Ensure the student exists in output even if inference fails later.
-            per_student_scores.setdefault(name, {})
+                try:
+                    clip_rgb = crop_clip(clip_bgr, crop_bbox)
+                    batch_clips.append(clip_rgb)
+                    batch_meta.append((name, fidx))
+                except Exception as e:
+                    logger.debug(f"clip crop failed for {name} at frame {fidx}: {e}")
+                    continue
 
+        # 4. Run batch inference
+        if batch_clips:
             try:
-                clip_rgb = crop_clip(frames_bgr, crop_bbox)
-                keyframe_items.append((name, crop_bbox))
-                keyframe_clips.append(clip_rgb)
-            except Exception as e:
-                logger.debug(f"clip crop failed for {name} at frame {fidx}: {e}")
-                continue
+                # Split into mini-batches to avoid OOM on GPU
+                # Each clip has ~16 frames. 64 clips ~= 1024 frames.
+                # 1024 frames * 224*224 * 3 * 4 bytes ~= 600MB input tensor.
+                # Plus activations, this is safe for most GPUs (4GB+).
+                MINI_BATCH_SIZE = 64
 
-        # Run action inference for this keyframe's clips
-        if keyframe_clips:
-            try:
-                # Batch inference on all clips from this keyframe
-                scores_list, tops = action_model.predict_proba(keyframe_clips, topk=3)
+                all_scores = []
 
-                # Normalize batch return shape
-                if isinstance(scores_list, dict):
-                    scores_list = [scores_list]
+                for i in range(0, len(batch_clips), MINI_BATCH_SIZE):
+                    chunk = batch_clips[i : i + MINI_BATCH_SIZE]
+                    try:
+                        # Batch inference on chunk
+                        scores_list, tops = action_model.predict_proba(chunk, topk=3)
 
-                # tops should be a list of ActionTopK
-                if not isinstance(tops, list):
-                    tops = [tops]
+                        # Normalize batch return shape
+                        if isinstance(scores_list, dict):
+                            scores_list = [scores_list]
+
+                        all_scores.extend(scores_list)
+
+                    except Exception as e:
+                        logger.warning(f"behavior: mini-batch inference failed for batch {batch_idx} chunk {i}: {e}")
+                        # Fill with empty results to maintain alignment with batch_meta
+                        all_scores.extend([{} for _ in range(len(chunk))])
 
                 # Match results with student names
                 alpha = float(cfg.smoothing_alpha)
@@ -361,8 +423,6 @@ def run_behavior_pipeline_on_result(
                 distracted_stay_min_margin = float(cfg.distracted_stay_min_margin)
 
                 def _pick_conservative_label(score_map: Dict[str, float]) -> str:
-                    # When we are uncertain and have no history, avoid collapsing into
-                    # 'distracted' (most costly false positive) and 'other'.
                     avoid = {"distracted", "other"}
                     items2 = sorted(score_map.items(), key=lambda kv: float(kv[1]), reverse=True)
                     for lbl2, _v2 in items2:
@@ -370,7 +430,7 @@ def run_behavior_pipeline_on_result(
                             return str(lbl2)
                     return str(items2[0][0]) if items2 else ""
 
-                for scores, (name, _bbox) in zip(scores_list, keyframe_items):
+                for scores, (name, fidx) in zip(all_scores, batch_meta):
                     if not isinstance(scores, dict) or not scores:
                         continue
 
@@ -392,12 +452,10 @@ def run_behavior_pipeline_on_result(
                     if min_margin > 0.0 and float(margin) < min_margin:
                         gated = True
 
-                    # EMA smoothing (CLIP only): smooth the score vector, then take argmax.
+                    # EMA smoothing (CLIP only)
                     if do_smooth:
                         st = ema_state.setdefault(name, {})
 
-                        # Stricter rule to enter distracted (optional): if current top-1 is
-                        # distracted but we weren't previously, require stronger evidence.
                         had_history = bool(st)
                         prev_lbl = max(st.items(), key=lambda kv: float(kv[1]))[0] if had_history else ""
                         if (
@@ -410,31 +468,25 @@ def run_behavior_pipeline_on_result(
                             if distracted_enter_min_margin > 0.0 and float(margin) < distracted_enter_min_margin:
                                 gated = True
 
-                        # Always update EMA state to build history.
+                        # Always update EMA state
                         for lbl, v in cur_scores.items():
                             prev = float(st.get(lbl, v))
                             st[lbl] = prev * alpha + float(v) * (1.0 - alpha)
-                        # Keep only labels that are still present to avoid unbounded growth.
                         for lbl in list(st.keys()):
                             if lbl not in cur_scores:
                                 st.pop(lbl, None)
 
                         if gated:
                             if had_history and prev_lbl:
-                                # Hold previous stable decision when uncertain.
                                 chosen_label = str(prev_lbl)
                             else:
                                 chosen_label = _pick_conservative_label(cur_scores)
                         else:
                             chosen_label = max(st.items(), key=lambda kv: float(kv[1]))[0] if st else top1_label
 
-                        # Additional rule: if we were previously distracted but current evidence for
-                        # distracted is weak, force-exit to a non-distracted conservative label.
                         if str(prev_lbl) == "distracted" and (
                             distracted_stay_min_prob > 0.0 or distracted_stay_min_margin > 0.0
                         ):
-                            # Evidence for staying distracted is based on current top-1 being distracted
-                            # and meeting prob/margin thresholds.
                             enough = True
                             if str(top1_label) != "distracted":
                                 enough = False
@@ -445,19 +497,17 @@ def run_behavior_pipeline_on_result(
                             if not enough:
                                 chosen_label = _pick_conservative_label(cur_scores)
                     else:
-                        # No smoothing: optional fallback label when uncertain.
                         if gated and fallback_label and fallback_label in cur_scores:
                             chosen_label = fallback_label
                         else:
                             chosen_label = top1_label
 
                     if chosen_label:
-                        # Hard assignment per frame, but decision is smoothed.
                         per_student_scores.setdefault(name, {}).setdefault(str(chosen_label), {})[int(fidx)] = 1.0
                         processed_tasks += 1
 
             except Exception as e:
-                logger.warning(f"behavior: action inference failed for keyframe {fidx}: {e}")
+                logger.warning(f"behavior: action inference failed for batch {batch_idx}: {e}")
 
         # Progress log
         try:

@@ -163,6 +163,74 @@ class FFmpegFrameReader:
             logger.error(f"FFmpeg frame reading failed: {e}")
             raise
 
+    def read_frame_range(self, start_frame: int, num_frames: int) -> List[np.ndarray]:
+        """Read a contiguous range of frames efficiently using ffmpeg seeking.
+
+        Args:
+            start_frame: Start frame index (0-based)
+            num_frames: Number of frames to read
+
+        Returns:
+            List of BGR frames
+        """
+        if num_frames <= 0:
+            return []
+
+        # Calculate start time
+        # Note: ffmpeg -ss before -i is fast and accurate (decodes and discards to reach timestamp)
+        start_time = max(0.0, start_frame / self.fps)
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+
+        # Add hardware acceleration if available
+        if self.hwaccel:
+            cmd += ["-hwaccel", self.hwaccel]
+
+        # Fast seek to start time
+        cmd += ["-ss", f"{start_time:.6f}"]
+
+        # Input
+        cmd += ["-i", self.video_path]
+
+        # Limit number of frames
+        cmd += ["-vframes", str(num_frames)]
+
+        # Output format
+        cmd += [
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "pipe:1",
+        ]
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            frames = []
+            frame_size = self.height * self.width * 3
+
+            while len(frames) < num_frames:
+                raw_data = proc.stdout.read(frame_size)
+                if len(raw_data) != frame_size:
+                    break
+
+                frame = np.frombuffer(raw_data, dtype=np.uint8).reshape((self.height, self.width, 3))
+                frames.append(frame)
+
+            proc.stdout.close()
+            proc.wait(timeout=30)
+
+            return frames
+
+        except Exception as e:
+            logger.error(f"FFmpeg frame range reading failed: {e}")
+            raise
+
     def close(self):
         """Cleanup (no-op for this implementation)."""
         pass
