@@ -22,6 +22,41 @@ const VideoPlayer: React.FC = () => {
 
   const [videoDimensions, setVideoDimensions] = useState({ width: 0, height: 0 });
 
+  function drawBBox(
+    ctx: CanvasRenderingContext2D,
+    bbox: BBox | number[],
+    color: string,
+    scaleX: number,
+    scaleY: number,
+    label: string | null,
+  ) {
+    let x, y, w, h;
+
+    if (Array.isArray(bbox)) {
+      x = bbox[0] * scaleX;
+      y = bbox[1] * scaleY;
+      w = (bbox[2] - bbox[0]) * scaleX;
+      h = (bbox[3] - bbox[1]) * scaleY;
+    } else {
+      x = bbox.x1 * scaleX;
+      y = bbox.y1 * scaleY;
+      w = (bbox.x2 - bbox.x1) * scaleX;
+      h = (bbox.y2 - bbox.y1) * scaleY;
+    }
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(x, y, w, h);
+
+    if (label) {
+      ctx.fillStyle = color;
+      ctx.fillRect(x, y - 20, ctx.measureText(label).width + 10, 20);
+      ctx.fillStyle = 'black';
+      ctx.font = '12px Arial';
+      ctx.fillText(label, x + 5, y - 5);
+    }
+  }
+
   // Sync store playing state with video element
   useEffect(() => {
     if (videoRef.current) {
@@ -81,6 +116,7 @@ const VideoPlayer: React.FC = () => {
         animationFrameId = requestAnimationFrame(render);
         return;
       }
+      const drawingCtx: CanvasRenderingContext2D = ctx;
 
       // Match canvas size to displayed video size
       if (canvas.width !== video.clientWidth || canvas.height !== video.clientHeight) {
@@ -89,7 +125,7 @@ const VideoPlayer: React.FC = () => {
       }
 
       // Clear canvas
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      drawingCtx.clearRect(0, 0, canvas.width, canvas.height);
 
       // Calculate scale
       const scaleX = canvas.width / (videoDimensions.width || 1);
@@ -98,7 +134,7 @@ const VideoPlayer: React.FC = () => {
       // Find current frame data using video.currentTime directly
       const fps = faceResults.meta.fps || 30;
       const currentVideoTime = video.currentTime;
-      let frameIndex = Math.round(currentVideoTime * fps);
+      const frameIndex = Math.round(currentVideoTime * fps);
       
       // Direct lookup for performance, with backtracking for gaps
       // Try to find the nearest previous frame if current one is missing (up to 15 frames / 0.5s)
@@ -131,80 +167,7 @@ const VideoPlayer: React.FC = () => {
           }
 
           // Draw Face BBox
-          drawBBox(ctx, det.bbox, 'rgba(0, 255, 0, 0.8)', scaleX, scaleY, identity);
-          
-          // Draw Body BBox
-          if (false && det.body_bbox) {
-            // Check if body bbox is not too far from face bbox
-            // Simple heuristic: body center should be close to face center horizontally
-            // and body should be below or containing face
-            
-            // However, the issue might be simpler: one body bbox might be assigned to multiple faces in the raw data 
-            // if the face-body matching was ambiguous.
-            // Or simply visualizing all body bboxes blindly.
-            
-            // Since `det` is a single detection object containing both `bbox` (face) and `body_bbox` (body),
-            // they SHOULD belong to the same person as per the backend logic.
-            // If they look mismatched visually, it might be an issue with coordinate scaling or backend matching.
-            
-            // Let's assume the pairing in JSON is correct (as provided by backend).
-            // We just need to draw it.
-            // If the user says "not the same person", maybe the backend matching is indeed wrong for some cases,
-            // OR we are drawing it wrong.
-            
-            // Let's check coordinates. 
-            // Face: [1104, 283, 1128, 316]
-            // Body: [1075, 272, 1177, 502]
-            // Face is inside/near top of Body. This looks correct for "蒋军".
-            
-            // Another case:
-            // Face: [1787, 474, 1832, 531] ("张浩")
-            // Body: [1669, 535, 1873, 743]
-            // Face y2=531, Body y1=535. Face is just above body? Or slightly overlapping?
-            // This seems plausible.
-            
-            // But wait, look at the third detection in chunk 0:
-            // Face: [1805, 403, 1847, 455] ("未知")
-            // Body: [1669, 535, 1873, 743]
-            // This is the SAME body bbox as "张浩"!
-            // So two faces are claiming the same body.
-            
-            // If we filter by student, e.g. "张浩", we draw his face and this shared body.
-            // If we filter by "未知", we draw his face and this SAME shared body.
-            // Visually, if "张浩" is selected, we see a body that might be far away from his face if the matching is wrong,
-            // or if it's a shared false positive.
-            
-            // In this specific case:
-            // "张浩" Face center: [1809, 502]
-            // "未知" Face center: [1826, 429]
-            // Body center: [1771, 639]
-            
-            // "张浩" is closer to the body than "未知".
-            
-            // If the user sees "body bbox not corresponding to face", it implies the visual link is broken.
-            // We should perhaps only draw the body bbox if we are sure it's a good match?
-            // Or maybe just draw a line connecting them to show the relationship?
-            // For now, let's just draw the box.
-            
-            // One possibility: The body bbox coordinates are in a different scale?
-            // No, they look consistent (1920x1080 range).
-            
-            // Is it possible we are drawing the WRONG body bbox?
-            // We are drawing `det.body_bbox`. It is explicitly linked in the JSON.
-            
-            drawBBox(ctx, det.body_bbox, 'rgba(255, 165, 0, 0.6)', scaleX, scaleY, null);
-            
-            // Optional: Draw a line connecting face center to body center to visualize the link
-            // const faceCx = (det.bbox[0] + det.bbox[2])/2 * scaleX;
-            // const faceCy = (det.bbox[1] + det.bbox[3])/2 * scaleY;
-            // const bodyCx = (det.body_bbox[0] + det.body_bbox[2])/2 * scaleX;
-            // const bodyCy = (det.body_bbox[1] + det.body_bbox[3])/2 * scaleY;
-            // ctx.beginPath();
-            // ctx.moveTo(faceCx, faceCy);
-            // ctx.lineTo(bodyCx, bodyCy);
-            // ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
-            // ctx.stroke();
-          }
+          drawBBox(drawingCtx, det.bbox, 'rgba(0, 255, 0, 0.8)', scaleX, scaleY, identity);
         });
       }
 
@@ -217,41 +180,6 @@ const VideoPlayer: React.FC = () => {
       cancelAnimationFrame(animationFrameId);
     };
   }, [faceResults, videoDimensions, selectedStudentId]); // selectedStudentId is a dependency, so effect re-runs when it changes
-
-  const drawBBox = (
-    ctx: CanvasRenderingContext2D, 
-    bbox: BBox | number[], 
-    color: string, 
-    scaleX: number, 
-    scaleY: number,
-    label: string | null
-  ) => {
-    let x, y, w, h;
-
-    if (Array.isArray(bbox)) {
-      x = bbox[0] * scaleX;
-      y = bbox[1] * scaleY;
-      w = (bbox[2] - bbox[0]) * scaleX;
-      h = (bbox[3] - bbox[1]) * scaleY;
-    } else {
-      x = bbox.x1 * scaleX;
-      y = bbox.y1 * scaleY;
-      w = (bbox.x2 - bbox.x1) * scaleX;
-      h = (bbox.y2 - bbox.y1) * scaleY;
-    }
-
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(x, y, w, h);
-
-    if (label) {
-      ctx.fillStyle = color;
-      ctx.fillRect(x, y - 20, ctx.measureText(label).width + 10, 20);
-      ctx.fillStyle = 'black';
-      ctx.font = '12px Arial';
-      ctx.fillText(label, x + 5, y - 5);
-    }
-  };
 
   const togglePlay = () => setIsPlaying(!isPlaying);
 

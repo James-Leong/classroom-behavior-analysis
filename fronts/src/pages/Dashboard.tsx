@@ -28,7 +28,7 @@ const Dashboard: React.FC = () => {
   // Prepare overview data
   const overviewData = behaviorStats 
     ? Object.entries(behaviorStats.by_student).map(([id, stats]) => {
-        const data: any = { name: id };
+        const data: Record<string, number | string> = { name: id };
         Object.entries(stats.behaviors).forEach(([label, bData]) => {
           // Use mapped keys if needed, but here we just map values
           // Actually, we should check if label is in our known list
@@ -100,9 +100,9 @@ const Dashboard: React.FC = () => {
                     <YAxis stroke="#9ca3af" />
                     <Tooltip 
                       contentStyle={{ backgroundColor: '#1f2937', border: 'none' }}
-                      formatter={(value: number, name: string) => [
-                        `${Math.round(value)}s`, 
-                        BEHAVIOR_LABELS[name] || name
+                      formatter={(value, name) => [
+                        `${Math.round((value ?? 0) as number)}s`,
+                        BEHAVIOR_LABELS[String(name)] || String(name),
                       ]}
                     />
                     <Legend formatter={(value) => BEHAVIOR_LABELS[value] || value} />
@@ -172,4 +172,3 @@ const Dashboard: React.FC = () => {
 };
 
 export default Dashboard;
-

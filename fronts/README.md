@@ -66,6 +66,54 @@ npm run build
 ```
 构建产物将生成在 `dist` 目录下。
 
+## 🌐 部署到 GitHub Pages（James-Leong.github.io）
+
+本项目使用 Vite 构建，产物是纯静态文件（`dist/`），可以直接部署到 GitHub Pages。
+
+### 方式 A：部署为主页（覆盖 James-Leong.github.io 根目录）
+
+1. 在本仓库构建：
+   ```bash
+   cd fronts
+   npm install
+   npm run build
+   ```
+2. 克隆你的 GitHub Pages 仓库并覆盖根目录内容：
+   ```bash
+   git clone git@github.com:James-Leong/James-Leong.github.io.git
+   rm -rf James-Leong.github.io/*
+   cp -r dist/* James-Leong.github.io/
+   ```
+3. （可选）放入数据文件（否则页面会自动降级使用 mock 数据）：
+   - 站点根目录需要有 `data/`，例如：
+     - `data/video/20251115_1h.mp4`
+     - `data/outputs/face_manifest.json`
+     - `data/outputs/face_chunk_*.json`
+     - `data/outputs/behavior_finetuned.json`
+     - `data/outputs/debug_trace.json`（可选）
+4. 在 `James-Leong.github.io` 仓库提交并推送：
+   ```bash
+   cd James-Leong.github.io
+   git add -A
+   git commit -m "Deploy classroom behavior analysis frontend"
+   git push
+   ```
+5. 在 GitHub 仓库 Settings → Pages，选择从默认分支（通常是 `main`）的根目录部署。
+
+### 方式 B：部署为子路径（保留你现有主页内容）
+
+如果你不想覆盖根目录，可以把前端放在子目录（例如 `cba/`），访问地址会变成：
+`https://james-leong.github.io/cba/`
+
+```bash
+git clone git@github.com:James-Leong/James-Leong.github.io.git
+mkdir -p James-Leong.github.io/cba
+rm -rf James-Leong.github.io/cba/*
+cp -r dist/* James-Leong.github.io/cba/
+```
+
+如果需要真实数据，把 `data/` 放到 `James-Leong.github.io/cba/data/`。
+
 ## 📊 数据准备
 
 为了在处理大型数据集（例如长达一小时的视频分析）时获得最佳性能，本项目采用了数据分块加载策略。
