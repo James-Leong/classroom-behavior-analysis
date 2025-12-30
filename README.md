@@ -60,10 +60,36 @@ python behavior_analyzer.py \
 
 **输出**：行为统计JSON文件
 
+使用人体识别增强的行为识别：
+```bash
+python behavior_analyzer.py \
+    --face-json outputs/face_results_1h.json \
+    --video data/video/20251115_1h.mp4 \
+    --person-detector models/yolo11n_classroom_context/weights/best.pt \
+    --output-json outputs/behavior_finetuned.json
+```
+
+### 使用GPU服务器推理
+
+首先将项目打包：
+```bash
+tar -zcvf behavior.tar.gz --exclude=".git" --exclude="./.ruff_cache" --exclude="./outputs" --exclude="./.venv" ./
+```
+
+然后将 `behavior.tar.gz` 上传到GPU服务器，解压后安装依赖并运行：
+
+```bash
+tar -zxvf behavior.tar.gz
+uv sync  # 或 pip install -r requirements.txt
+```
+
+然后按照前述命令运行人脸识别和行为识别。
+
 ## 📚 文档
 
 - [开发环境指南](./docs/DEV_ENVIRONMENT.md) - 根据不同的设备，配置开发环境的说明
 - [CLIP使用指南](./docs/CLIP_USAGE.md) - 如何使用CLIP模型进行行为识别
+- [YOLO身体框识别模型](./docs/YOLO_finetune_for_context.md) - 如何微调YOLO模型进行身体框识别
 
 ## 模型下载
 

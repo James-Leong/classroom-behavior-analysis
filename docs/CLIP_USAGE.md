@@ -161,6 +161,59 @@ DEFAULT_LABELS = [
 ]
 ```
 
+## 基于标注的优化迭代（推荐）
+
+CLIP 在本项目里是 Zero-Shot（不训练），但可以通过“标注 → 评估 → 改提示词/策略 → 再评估”的方式持续提升效果。
+
+### 1) 准备标注数据（manifest.jsonl）
+
+推荐使用 JSONL（每行一个样本），路径：`data/annotations/manifest.jsonl`。字段建议与现有数据保持一致：
+
+- `video_path`：原视频绝对路径
+- `frame`：中心帧号（从 0 开始）
+- `crop_bbox_xyxy`：用于行为识别的裁剪框（`[x1,y1,x2,y2]`）
+- `annotator_label`：人工最终标签（细粒度/业务标签均可）
+- `target_label`：当时的“候选/提案标签”（可选，但用于评估人工纠偏量很有用）
+- `track_is_locked`、`student_id`、`quality`、`similarity`、`paths`：可选信息，便于筛选和回溯
+
+### 2) 明确“细标签 → CLIP 粗标签”的映射
+
+当前 CLIP 推理输出的是一组“粗标签”（见 `src/behavior/action_model_clip.py` 的 `DEFAULT_LABELS`）。如果你的人工标注是更细的业务标签（例如 `listening_upright/on_task_head_down/off_task`），需要做一个映射，常见做法是：
+
+- `listening_upright` → `listening`
+- `on_task_head_down` → `reading_or_writing`
+- `off_task` → `distracted`
+- `using_device` → `using_device`
+- 其他不确定/遮挡/多人干扰 → `other`
+
+### 3) 用标注评估并定位问题样本
+
+使用 `scripts/calibrate_from_annotations.py` 生成评估报告（支持两类评估）：
+
+- `heuristic`：评估 `target_label`（提案）与 `annotator_label`（人工）的差异，适合快速看“标注纠偏量/类别混淆”。
+- `clip`：根据 `video_path + frame + crop_bbox_xyxy` 重新跑一次 CLIP（粗标签），再与人工映射后的粗标签比对，适合验证“当前提示词/温度/裁剪框”整体质量。
+
+脚本默认读取 `data/annotations/manifest.jsonl` 并输出到 `outputs/calibration_report.json`。
+
+### 4) 针对性优化（从高收益到低收益）
+
+1. **改提示词（最常用）**：在 `src/behavior/action_model_clip.py` 的 `DEFAULT_PROMPTS_BY_LABEL` 里增加/替换多条描述，优先强化易混淆对：
+   - `listening` vs `reading_or_writing`（抬头听课 vs 低头写读）
+   - `distracted` vs `listening`（左顾右盼 vs 视线朝前）
+   - `using_device` vs `reading_or_writing`（手机屏幕 vs 书本/作业本）
+2. **调温度（temperature）**：`CLIPVideoActionModel(..., temperature=...)` 越大分布越“尖”，越小越“平”。在 `src/behavior/pipeline.py` 的 `BehaviorPipelineConfig.clip_temperature` 调整。
+3. **启用/调不确定性门控**：在 `src/behavior/pipeline.py` 的 `BehaviorPipelineConfig` 中，通过 `uncertain_min_prob/uncertain_min_margin/uncertain_fallback_label` 把低置信度样本归入 `other`（或更保守的类别），减少误报。
+4. **优化裁剪框（crop）**：如果 `crop_bbox_xyxy` 经常截掉手/桌面/手机等关键上下文，会导致 `using_device` 召回差。优先保证 crop 覆盖上半身与桌面区域（必要时改 `expand_bbox_xyxy` 的参数策略）。
+5. **提升人体框质量（可选）**：如果 body bbox 不稳定，先提升 person 检测质量（例如使用微调过的 YOLO 权重）再跑 CLIP，往往比只改提示词更稳。
+
+### 5) 固化策略并回归验证
+
+每次改动建议只改一类因素（提示词/温度/门控/裁剪），然后复跑一次评估报告，对比：
+
+- 混淆矩阵里主要混淆对是否下降
+- `other` 是否合理上升（更保守）还是过度上升（过分不确定）
+- 针对关键标签（如 `using_device`）的召回是否提升
+
 ## 性能优化建议
 
 ### GPU 利用率优化

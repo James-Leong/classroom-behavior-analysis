@@ -173,6 +173,20 @@ def main() -> None:
         help="计算设备：auto/cpu/gpu（默认auto：有CUDA就用GPU）",
     )
 
+    # Person检测器配置
+    parser.add_argument(
+        "--person-detector",
+        type=str,
+        default=None,
+        help="Person检测器模型路径（如 models/yolo11n_classroom_context/weights/best.pt）；不指定则使用JSON中的body_bbox",
+    )
+    parser.add_argument(
+        "--person-conf",
+        type=float,
+        default=0.25,
+        help="Person检测置信度阈值（默认: 0.25）",
+    )
+
     # 行为检测阈值
     parser.add_argument(
         "--th-on",
@@ -294,8 +308,8 @@ def main() -> None:
         device=str(args.device),
         clip_seconds=float(args.clip_seconds),
         clip_num_frames=int(args.clip_frames),
-        person_detector_weights=None,  # Not needed, using body_bbox from JSON
-        person_conf=0.25,
+        person_detector_weights=args.person_detector,
+        person_conf=float(args.person_conf),
         series_cfg=BehaviorSeriesConfig(
             th_on=float(args.th_on),
             th_off=float(args.th_off),
@@ -323,6 +337,7 @@ def main() -> None:
         logger.info(f"  CLIP模型: {args.clip_model}")
     else:
         logger.info(f"  Kinetics模型: {args.kinetics_model}")
+    logger.info(f"  Person检测器: {args.person_detector if args.person_detector else '使用JSON body_bbox'}")
     logger.info(f"  分析目标: {args.target if args.target else '所有已锁定身份'}")
     logger.info("=" * 60)
 
