@@ -3,16 +3,17 @@ from __future__ import annotations
 import time
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Set
 
 import cv2
 
 from src.behavior.action_model import TorchvisionVideoActionModel
 from src.behavior.action_model_clip import CLIPVideoActionModel
+from src.behavior.debug import DebugTraceCollector
 from src.behavior.person_detector import UltralyticsPersonDetector, pick_person_bbox_for_face
 from src.behavior.report import build_behavior_stats
 from src.behavior.stats import BehaviorSeriesConfig
-from src.behavior.video_clip import crop_clip, read_frames_by_index, sample_frame_indices
+from src.behavior.video_clip import crop_clip, sample_frame_indices
 from src.utils.log import get_logger
 from src.video.ffmpeg_reader import FFmpegFrameReader
 
@@ -101,6 +102,7 @@ def run_behavior_pipeline_on_result(
     input_video: str,
     result: Dict,
     cfg: BehaviorPipelineConfig,
+    debug_collector: Optional[DebugTraceCollector] = None,
 ) -> Optional[Dict]:
     """Run action model inference and build per-student behavior statistics.
 
@@ -373,7 +375,7 @@ def run_behavior_pipeline_on_result(
                 try:
                     clip_rgb = crop_clip(clip_bgr, crop_bbox)
                     batch_clips.append(clip_rgb)
-                    batch_meta.append((name, fidx))
+                    batch_meta.append((name, fidx, crop_bbox))
                 except Exception as e:
                     logger.debug(f"clip crop failed for {name} at frame {fidx}: {e}")
                     continue
@@ -430,7 +432,7 @@ def run_behavior_pipeline_on_result(
                             return str(lbl2)
                     return str(items2[0][0]) if items2 else ""
 
-                for scores, (name, fidx) in zip(all_scores, batch_meta):
+                for scores, (name, fidx, crop_bbox) in zip(all_scores, batch_meta):
                     if not isinstance(scores, dict) or not scores:
                         continue
 
@@ -505,6 +507,24 @@ def run_behavior_pipeline_on_result(
                     if chosen_label:
                         per_student_scores.setdefault(name, {}).setdefault(str(chosen_label), {})[int(fidx)] = 1.0
                         processed_tasks += 1
+
+                    if debug_collector:
+                        gating_info = {
+                            "gated": gated,
+                            "top1_prob": float(top1_prob),
+                            "margin": float(margin),
+                            "top1_label": str(top1_label),
+                        }
+                        current_ema = ema_state.get(name, {}).copy() if do_smooth else {}
+                        debug_collector.add_entry(
+                            frame_idx=int(fidx),
+                            student_name=name,
+                            raw_scores=cur_scores,
+                            ema_scores=current_ema,
+                            chosen_label=str(chosen_label),
+                            gating_info=gating_info,
+                            crop_bbox=list(crop_bbox),
+                        )
 
             except Exception as e:
                 logger.warning(f"behavior: action inference failed for batch {batch_idx}: {e}")
