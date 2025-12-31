@@ -1,5 +1,7 @@
 # 课堂行为分析前端系统 (Classroom Behavior Analysis Frontend)
 
+**在线演示地址**: [https://james-leong.github.io/classroom-behavior-analysis/](https://james-leong.github.io/classroom-behavior-analysis/)
+
 这是一个用于分析和可视化课堂学生行为的综合仪表盘系统。作为课堂行为分析项目的可视化前端，它提供了实时视频回放、行为统计洞察以及详细的学生个人行为指标分析功能。
 
 ## 📋 功能特性
