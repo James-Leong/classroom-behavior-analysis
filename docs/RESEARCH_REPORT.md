@@ -7,28 +7,52 @@
 ---
 
 ## 摘要
-本报告面向真实课堂监控视频场景，系统性总结一套离线课堂行为分析系统的研究与实现。系统采用“两阶段解耦”架构：阶段一对输入视频执行人脸识别与轨迹跟踪，并通过身份锁定/切换检测与 body bbox 辅助回退跟踪，生成包含轨迹历史与锁定状态的 Schema v2 Face JSON（示例：`outputs/face_results_1h.json`）；阶段二在稳定身份约束下从原视频裁剪动作片段，使用 Kinetics 预训练视频模型或 CLIP 零样本模型进行行为识别，并通过时序平滑与不确定性门控输出按学生聚合的行为统计（示例：`outputs/behavior_finetuned.json`），同时可输出逐帧推理调试轨迹（`outputs/debug_trace.json`）供前端展示。针对课堂场景“小脸/遮挡/低头导致人脸间歇缺失”“身份抖动导致统计不可用”“通用动作类别不贴合课堂语义”“小时级数据浏览器加载瓶颈”等问题，系统在检测、跟踪、身份稳定、行为推理与可视化数据工程多个层面提出并实现优化：平铺检测 + IoU-NMS 去重提升小脸召回；两阶段匹配与 body-only 回退显著提升遮挡/低头场景轨迹连续性；在线聚合 embedding 减少轨迹合并开销；基于滞回的身份锁定/解锁降低 identity flicker；在裁剪框层面引入“身体框优先”的三层策略（Face JSON 的 `body_bbox` → YOLO person 检测框匹配 → 人脸框扩展回退）；并进一步对 YOLO 进行“学生上下文框（包含桌面/设备）”迁移学习微调，以提高 `using_device` 类别的可观测上下文；CLIP 侧通过多提示语聚合与 GPU 端批量预处理/一次性帧编码提升语义鲁棒性与吞吐，并提供基于标注数据的校准脚本与参数搜索报告（`outputs/calibration_report.json`、`outputs/calibration_search_report.json`）用于迭代提示词/温度/门控阈值；前端采用 manifest+chunk 分块加载实现小时级 JSON 的流畅回放与联动分析。报告以代码片段、伪代码与结果文件为证据链，给出关键算法设计、实现细节与实验观察，并讨论局限性与隐私合规。
+本报告面向真实课堂监控视频场景，系统性总结了一套离线课堂行为分析系统的研究与实现。针对课堂场景中人脸遮挡、身份抖动及动作语义不贴合等挑战，系统采用“两阶段解耦”架构：第一阶段聚焦高鲁棒性的人脸检测与轨迹跟踪，生成稳定的身份轨迹；第二阶段在稳定身份约束下，利用预训练视频模型或零样本 CLIP 模型进行行为识别，并通过时序平滑与多模态优化输出按学生聚合的行为统计。报告详细阐述了从检测跟踪优化、身份稳定策略到行为推理增强的全链路技术方案，并提供了完整的代码实现与实验验证。
 
 **关键词**：课堂行为分析；人脸识别；多目标跟踪；身份锁定；CLIP；零样本学习；时序平滑；可视化
 
 ---
 
 ## 1 引言
-课堂行为分析同时具有工程挑战与研究价值。与短时动作识别不同，课堂场景常呈现：小人脸与遮挡、长时序统计对主体一致性的强依赖、动作语义域不匹配以及可解释可追溯需求。单帧识别在低头/遮挡场景中会间歇失效，导致身份抖动（identity flicker），使得“按学生聚合的行为占比/分段”不再可信。另一方面，通用动作识别模型在课堂中易输出语义不贴合类别，难以支撑教学评估的解释性要求。
+课堂行为分析同时具有工程挑战与研究价值。与短时动作识别不同，课堂场景常呈现：小人脸与遮挡、长时序统计对主体一致性的强依赖、动作语义域不匹配以及可解释可追溯需求。单帧识别在低头/遮挡场景中会间歇失效，导致身份抖动，使得“按学生聚合的行为占比/分段”不再可信。另一方面，通用动作识别模型在课堂中易输出语义不贴合类别，难以支撑教学评估的解释性要求。
 
 为此，本项目以“身份稳定优先”为原则，采用两阶段解耦流水线：先生成稳定身份轨迹，再在稳定主体条件下做行为识别，并通过前端将检测框、时间线与推理分数统一呈现，形成可追溯证据链。
 
 ---
 
 ## 2 系统概述与数据流
-阶段一入口为 [video_recognizer.py](video_recognizer.py)，核心在 [recognizer.py](../src/video/recognizer.py) 与 [tracker.py](../src/video/tracker.py)。阶段二入口为 [behavior_analyzer.py](behavior_analyzer.py)，核心在 [pipeline.py](../src/behavior/pipeline.py)。演示前端位于 [fronts/](fronts/)。
+
+### 2.1 核心架构
+系统采用“两阶段解耦”架构，旨在解决复杂课堂场景下的行为分析难题：
+- **阶段一（Phase 1）**：对输入视频执行人脸识别与轨迹跟踪。通过身份锁定/切换检测与身体框辅助回退跟踪，生成包含轨迹历史与锁定状态的结构化输出信息。
+- **阶段二（Phase 2）**：在稳定身份约束下从原视频裁剪动作片段。使用 Kinetics 预训练视频模型或 CLIP 零样本模型进行行为识别，并通过时序平滑与不确定性门控输出按学生聚合的行为统计，同时可输出逐帧推理调试轨迹供前端展示。
+
+### 2.2 关键特性与优化策略
+针对课堂场景的具体挑战，系统在多个层面实现了深度优化：
+
+1.  **检测与跟踪增强**：
+    - 针对小脸问题，采用 **平铺检测 (Tiled Detection) + IoU-NMS 去重** 策略提升召回率。
+    - 针对遮挡与低头场景，引入 **两阶段匹配与 Body-only 回退** 机制，显著提升轨迹连续性。
+    - 采用 **在线聚合 Embedding** 减少轨迹合并开销，并基于 **滞回策略 (Hysteresis)** 进行身份锁定/解锁，有效降低身份抖动。
+
+2.  **行为推理与语义对齐**：
+    - 在裁剪框层面引入 **“身体框优先”的三层策略**：优先使用人脸识别输出的人物框 `body_bbox` → 其次尝试 YOLO person 检测框匹配 → 最后回退至人脸框扩展。
+    - 对 YOLO 进行 **“学生上下文框”迁移学习微调**，使其包含桌面/设备信息，从而提高 `using_device` 等类别的可观测性。
+    - CLIP 模型侧通过 **多提示语聚合** 与 **GPU 端批量预处理/一次性帧编码** 提升语义鲁棒性与吞吐量。
+    - 提供基于标注数据的 **校准脚本与参数搜索报告** ，用于迭代优化提示词、温度与门控阈值。
+
+3.  **数据工程与可视化**：
+    - 前端（基于 React + Vite + Recharts）采用 **Manifest + Chunk 分块加载** 技术，实现小时级 JSON 数据的流畅回放与联动分析，解决浏览器加载瓶颈。
+
+### 2.3 数据流与入口
+阶段一入口为 [video_recognizer.py](../video_recognizer.py)，核心在 [recognizer.py](../src/video/recognizer.py) 与 [tracker.py](../src/video/tracker.py)。阶段二入口为 [behavior_analyzer.py](../behavior_analyzer.py)，核心在 [pipeline.py](../src/behavior/pipeline.py)。演示前端位于 [fronts/](../fronts/)。
 
 ```mermaid
 flowchart LR
     A[输入视频] --> B[阶段一：人脸识别 + 轨迹跟踪]
-    B --> C[Face JSON v2]
+    B --> C[Face JSON]
     C --> D[阶段二：行为识别 + 时序后处理]
-    D --> E[Behavior Stats JSON]
+    D --> E[Behavior JSON]
     C --> F[前端：分块加载 + 叠加回放]
     E --> F
 ```
@@ -172,13 +196,13 @@ def pick_person_bbox_for_face(persons, face_bbox):
 该匹配器的设计体现了“高召回优先”的课堂偏好：宁可在第二层命中更多候选，再由第三层/门控/平滑抑制误报，也不希望裁剪框频繁退化为 face-only 扩展（因为会丢失桌面/设备上下文）。
 
 #### 3.2.3 身体框识别与 YOLO 上下文微调：从 tight person 到 student_context
-仅依赖 COCO `person` 类的 tight bbox，往往无法覆盖桌面与设备，导致 CLIP 看到的裁剪片段缺少“手机/电脑”等关键物体，进而将 `using_device` 误判为 `reading_or_writing` 或 `listening`。为此，本项目将“身体框识别”扩展为“学生上下文框（student_context）”，并提供从抽帧、预标注、标注到微调训练的完整工具链（文档：[YOLO_finetune_for_context.md](docs/YOLO_finetune_for_context.md)）。
+仅依赖 COCO `person` 类的 tight bbox，往往无法覆盖桌面与设备，导致 CLIP 看到的裁剪片段缺少“手机/电脑”等关键物体，进而将 `using_device` 误判为 `reading_or_writing` 或 `listening`。为此，本项目将“身体框识别”扩展为“学生上下文框（student_context）”，并提供从抽帧、预标注、标注到微调训练的完整工具链（文档：[YOLO_finetune_for_context.md](YOLO_finetune_for_context.md)）。
 
 核心思想是迁移学习：保持预训练 backbone，替换检测 head，使模型输出单类 `student_context`，其标注原则要求框覆盖“学生上身+双手+桌面交互对象（书本/手机/笔记本电脑）”。工具链包括：
 
-- 抽帧与预标注：`scripts/prepare_yolo_data.py`（生成 YOLO 数据集与 Label Studio 任务；见 [prepare_yolo_data.py](scripts/prepare_yolo_data.py#L22-L113)）  
-- 训练微调：`scripts/train_yolo_finetune.py`（调用 ultralytics YOLO API；见 [train_yolo_finetune.py](scripts/train_yolo_finetune.py#L12-L45)）  
-- 推理集成：通过 `BehaviorPipelineConfig.person_detector_weights` 或命令行 `--person-detector` 指向 `models/<name>/weights/best.pt`（文档说明见 [YOLO_finetune_for_context.md](docs/YOLO_finetune_for_context.md#L60-L70)）
+- 抽帧与预标注：`scripts/prepare_yolo_data.py`（生成 YOLO 数据集与 Label Studio 任务；见 [prepare_yolo_data.py](../scripts/prepare_yolo_data.py#L22-L113)）  
+- 训练微调：`scripts/train_yolo_finetune.py`（调用 ultralytics YOLO API；见 [train_yolo_finetune.py](../scripts/train_yolo_finetune.py#L12-L45)）  
+- 推理集成：通过 `BehaviorPipelineConfig.person_detector_weights` 或命令行 `--person-detector` 指向 `models/<name>/weights/best.pt`（文档说明见 [YOLO_finetune_for_context.md](YOLO_finetune_for_context.md#L60-L70)）
 
 **原始代码片段（数据准备：只保留 person 类并构建单类数据集）**：
 
@@ -450,7 +474,7 @@ score = accuracy + 0.5*listening_recall + 0.3*distracted_recall
 
 ## 6 讨论与局限
 1) 身份切换检测路径中存在“需要分割但暂未实现”的逻辑（见 [recognizer.py:L373-L377](../src/video/recognizer.py#L373-L377)）。后续可实现轨迹分割以形成更严格的主体一致性约束。  
-2) CLIP 零样本无需训练，但对提示语与裁剪框质量敏感。建议采用标注驱动的校准流程（见 [CLIP_USAGE.md](docs/CLIP_USAGE.md)）。  
+2) CLIP 零样本无需训练，但对提示语与裁剪框质量敏感。建议采用标注驱动的校准流程（见 [CLIP_USAGE.md](CLIP_USAGE.md)）。  
 3) 课堂视频与人脸属于敏感数据，真实部署需遵循授权、最小化存储、访问控制与审计机制。
 ---
 
