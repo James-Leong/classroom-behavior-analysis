@@ -45,7 +45,7 @@
     - 前端（基于 React + Vite + Recharts）采用 **Manifest + Chunk 分块加载** 技术，实现小时级 JSON 数据的流畅回放与联动分析，解决浏览器加载瓶颈。
 
 ### 2.3 数据流与入口
-阶段一入口为 [video_recognizer.py](../video_recognizer.py)，核心在 [recognizer.py](../src/video/recognizer.py) 与 [tracker.py](../src/video/tracker.py)。阶段二入口为 [behavior_analyzer.py](../behavior_analyzer.py)，核心在 [pipeline.py](../src/behavior/pipeline.py)。演示前端位于 [fronts/](../fronts/)。
+阶段一入口为 [video_recognizer.py](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/video_recognizer.py)，核心在 [recognizer.py](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/video/recognizer.py) 与 [tracker.py](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/video/tracker.py)。阶段二入口为 [behavior_analyzer.py](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/behavior_analyzer.py)，核心在 [pipeline.py](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/behavior/pipeline.py)。演示前端位于 [fronts/](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/fronts/)。
 
 ```mermaid
 flowchart LR
@@ -63,8 +63,8 @@ flowchart LR
 
 ### 3.1 阶段一：人脸识别与小脸召回增强
 阶段一的人脸识别以 InsightFace 为主链路，并引入平铺检测（tile）以提升密集小脸召回。平铺检测后使用 IoU-NMS 去重，避免跨 tile 重复框带来的“同一人多框”问题。对应实现见：
-- 平铺检测：[recognizer.py:_detect_faces_insightface_tiled](../src/face/recognizer.py#L494-L623)
-- IoU-NMS 去重：[recognizer.py:_dedupe_faces_nms](../src/face/recognizer.py#L625-L673)
+- 平铺检测：[recognizer.py:_detect_faces_insightface_tiled](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/face/recognizer.py#L494-L623)
+- IoU-NMS 去重：[recognizer.py:_dedupe_faces_nms](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/face/recognizer.py#L625-L673)
 
 ### 3.2 阶段一：轨迹跟踪与 body-only 回退
 课堂场景的关键问题是“脸缺失但人仍在”。系统在跟踪阶段引入 Phase 2 的 body bbox 回退，以维持轨迹连续性。
@@ -84,7 +84,7 @@ Input: tracks T, face detections D, person detections P
 Output: updated tracks
 ```
 
-**原始代码片段（实现证据）**：见 [tracker.py:L302-L367](../src/video/tracker.py#L302-L367)
+**原始代码片段（实现证据）**：见 [tracker.py:L302-L367](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/video/tracker.py#L302-L367)
 
 ```python
 if body_bboxes:
@@ -113,7 +113,7 @@ if body_bboxes:
 2) 若缺失 `body_bbox`，则运行 YOLO person 检测并将 face 与 person 框进行匹配（见 3.2.2）  
 3) 若仍失败，则将 face bbox 按启发式规则扩大为上半身裁剪框（fallback expansion）
 
-该策略的直接实现位于行为流水线的裁剪框选择逻辑（见 [pipeline.py:L341-L370](../src/behavior/pipeline.py#L341-L370)）：
+该策略的直接实现位于行为流水线的裁剪框选择逻辑（见 [pipeline.py:L341-L370](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/behavior/pipeline.py#L341-L370)）：
 
 ```python
 # Priority 1: Use body_bbox from JSON (v2 schema)
@@ -144,7 +144,7 @@ if crop_bbox is None:
 从“系统工程贡献”角度，这一三层策略将身体框能力与行为识别性能绑定为可解释的因果链：当 `using_device` 等类别误判时，首先检查裁剪框是否覆盖桌面/设备，再决定是“检测器问题（需要微调）”还是“提示词/门控问题（需要校准）”。
 
 #### 3.2.2 Face→Person 匹配：点-框距离约束与覆盖率权衡
-在优先级策略的第二层中，系统需要将“人脸框”关联到“person 检测框”，以避免误把相邻学生的身体框用于当前学生。项目实现了一个轻量的匹配器 `pick_person_bbox_for_face`（见 [person_detector.py](../src/behavior/person_detector.py#L60-L108)）：
+在优先级策略的第二层中，系统需要将“人脸框”关联到“person 检测框”，以避免误把相邻学生的身体框用于当前学生。项目实现了一个轻量的匹配器 `pick_person_bbox_for_face`（见 [person_detector.py](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/behavior/person_detector.py#L60-L108)）：
 
 - 以人脸中心点为查询点，计算其到候选 person 框的点-矩形距离  
 - 使用“水平松弛窗口”提高召回（适配教室密集座位），并用“归一化距离阈值”拒绝过远匹配
@@ -196,13 +196,13 @@ def pick_person_bbox_for_face(persons, face_bbox):
 该匹配器的设计体现了“高召回优先”的课堂偏好：宁可在第二层命中更多候选，再由第三层/门控/平滑抑制误报，也不希望裁剪框频繁退化为 face-only 扩展（因为会丢失桌面/设备上下文）。
 
 #### 3.2.3 身体框识别与 YOLO 上下文微调：从 tight person 到 student_context
-仅依赖 COCO `person` 类的 tight bbox，往往无法覆盖桌面与设备，导致 CLIP 看到的裁剪片段缺少“手机/电脑”等关键物体，进而将 `using_device` 误判为 `reading_or_writing` 或 `listening`。为此，本项目将“身体框识别”扩展为“学生上下文框（student_context）”，并提供从抽帧、预标注、标注到微调训练的完整工具链（文档：[YOLO_finetune_for_context.md](YOLO_finetune_for_context.md)）。
+仅依赖 COCO `person` 类的 tight bbox，往往无法覆盖桌面与设备，导致 CLIP 看到的裁剪片段缺少“手机/电脑”等关键物体，进而将 `using_device` 误判为 `reading_or_writing` 或 `listening`。为此，本项目将“身体框识别”扩展为“学生上下文框（student_context）”，并提供从抽帧、预标注、标注到微调训练的完整工具链（文档：[YOLO_finetune_for_context.md](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/docs/YOLO_finetune_for_context.md)）。
 
 核心思想是迁移学习：保持预训练 backbone，替换检测 head，使模型输出单类 `student_context`，其标注原则要求框覆盖“学生上身+双手+桌面交互对象（书本/手机/笔记本电脑）”。工具链包括：
 
-- 抽帧与预标注：`scripts/prepare_yolo_data.py`（生成 YOLO 数据集与 Label Studio 任务；见 [prepare_yolo_data.py](../scripts/prepare_yolo_data.py#L22-L113)）  
-- 训练微调：`scripts/train_yolo_finetune.py`（调用 ultralytics YOLO API；见 [train_yolo_finetune.py](../scripts/train_yolo_finetune.py#L12-L45)）  
-- 推理集成：通过 `BehaviorPipelineConfig.person_detector_weights` 或命令行 `--person-detector` 指向 `models/<name>/weights/best.pt`（文档说明见 [YOLO_finetune_for_context.md](YOLO_finetune_for_context.md#L60-L70)）
+- 抽帧与预标注：`scripts/prepare_yolo_data.py`（生成 YOLO 数据集与 Label Studio 任务；见 [prepare_yolo_data.py](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/scripts/prepare_yolo_data.py#L22-L113)）  
+- 训练微调：`scripts/train_yolo_finetune.py`（调用 ultralytics YOLO API；见 [train_yolo_finetune.py](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/scripts/train_yolo_finetune.py#L12-L45)）  
+- 推理集成：通过 `BehaviorPipelineConfig.person_detector_weights` 或命令行 `--person-detector` 指向 `models/<name>/weights/best.pt`（文档说明见 [YOLO_finetune_for_context.md](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/docs/YOLO_finetune_for_context.md#L60-L70)）
 
 **原始代码片段（数据准备：只保留 person 类并构建单类数据集）**：
 
@@ -252,7 +252,7 @@ Input per detection: embedding e, quality q
 Output: agg_embedding, agg_weight
 ```
 
-**原始代码片段（在线聚合更新）**：见 [tracker.py:L76-L123](../src/video/tracker.py#L76-L123)
+**原始代码片段（在线聚合更新）**：见 [tracker.py:L76-L123](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/video/tracker.py#L76-L123)
 
 ```python
 w = float(max(0.05, min(1.0, quality)))
@@ -268,12 +268,12 @@ else:
     self.agg_weight = float(self.agg_weight) + w
 ```
 
-在轨迹合并 `merge_similar_tracks` 中，系统直接取 `agg_embedding` 做余弦相似度比较，并在合并后同步合并聚合状态（见 [tracker.py:L460-L551](../src/video/tracker.py#L460-L551)）。该优化使得“身份维护”可以在小时级视频中以近似常数代价增量更新，为后续的锁定/切换检测提供稳定表征。
+在轨迹合并 `merge_similar_tracks` 中，系统直接取 `agg_embedding` 做余弦相似度比较，并在合并后同步合并聚合状态（见 [tracker.py:L460-L551](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/video/tracker.py#L460-L551)）。该优化使得“身份维护”可以在小时级视频中以近似常数代价增量更新，为后续的锁定/切换检测提供稳定表征。
 
 ### 3.3 阶段一：身份稳定（多帧强化 + 滞回锁定/解锁 + 切换检测）
 系统将身份由“逐帧分类”提升为“轨迹状态机”。核心逻辑在：
-- 多帧强化 re-id：[recognizer.py:_refresh_track_identities](../src/video/recognizer.py#L221-L247)
-- 滞回锁定/解锁与切换检测：[recognizer.py:_apply_identity_hysteresis](../src/video/recognizer.py#L248-L419)
+- 多帧强化 re-id：[recognizer.py:_refresh_track_identities](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/video/recognizer.py#L221-L247)
+- 滞回锁定/解锁与切换检测：[recognizer.py:_apply_identity_hysteresis](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/video/recognizer.py#L248-L419)
 
 **算法 2：身份滞回状态机（伪代码）**
 
@@ -296,7 +296,7 @@ If unlock conditions satisfied: unlock
 Output: display_identity, is_locked
 ```
 
-**原始代码片段（body-only 冻结证据）**：见 [recognizer.py:L333-L351](../src/video/recognizer.py#L333-L351)
+**原始代码片段（body-only 冻结证据）**：见 [recognizer.py:L333-L351](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/video/recognizer.py#L333-L351)
 
 ```python
 elif cand == "未知":
@@ -320,7 +320,7 @@ else:
 阶段二在稳定身份前提下，对每个学生按时间采样裁剪 clip，并推理行为标签。系统同时支持 Kinetics 与 CLIP，其中 CLIP 方案强调类别可控与语义贴合。
 
 #### 3.4.1 CLIP 批量推理（一次性帧编码）
-实现位于 [action_model_clip.py:_predict_batch_optimized](../src/behavior/action_model_clip.py#L268-L345)。
+实现位于 [action_model_clip.py:_predict_batch_optimized](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/behavior/action_model_clip.py#L268-L345)。
 
 **算法 3：CLIP 批量推理（伪代码）**
 
@@ -332,7 +332,7 @@ Split features by clip and mean-pool over time
 Compute softmax(temperature * video_feature @ text_features^T)
 ```
 
-**原始代码片段（实现证据）**：见 [action_model_clip.py:L299-L327](../src/behavior/action_model_clip.py#L299-L327)
+**原始代码片段（实现证据）**：见 [action_model_clip.py:L299-L327](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/behavior/action_model_clip.py#L299-L327)
 
 ```python
 all_frames_concat = torch.cat(all_frame_tensors, dim=0)
@@ -345,7 +345,7 @@ similarity = (float(self.temperature) * video_features_batch @ self.text_feature
 ```
 
 #### 3.4.2 EMA 平滑与不确定性门控
-pipeline 通过概率阈值与 top1-top2 边际（margin）执行门控，并对分数做 EMA 平滑（实现见 [pipeline.py:L404-L527](../src/behavior/pipeline.py#L404-L527)）。
+pipeline 通过概率阈值与 top1-top2 边际（margin）执行门控，并对分数做 EMA 平滑（实现见 [pipeline.py:L404-L527](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/behavior/pipeline.py#L404-L527)）。
 ```python
 if min_prob > 0.0 and float(top1_prob) < min_prob:
     gated = True
@@ -361,7 +361,7 @@ else:
 ```
 
 ### 3.5 基于标注的 CLIP 校准：从“提示词/参数/门控”到可量化迭代
-本项目并未将 CLIP 仅作为“开箱即用”的零样本模块，而是建立了“标注→评估→定位混淆→迭代提示词/裁剪/阈值→再评估”的校准闭环（参见 [CLIP_USAGE.md](docs/CLIP_USAGE.md#L148-L213)）。
+本项目并未将 CLIP 仅作为“开箱即用”的零样本模块，而是建立了“标注→评估→定位混淆→迭代提示词/裁剪/阈值→再评估”的校准闭环（参见 [CLIP_USAGE.md](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/docs/CLIP_USAGE.md#L148-L213)）。
 
 #### 3.5.1 标注数据组织：manifest.jsonl
 推荐采用 JSONL（每行一个样本）记录“中心帧 + 裁剪框 + 人工标签”，其字段与后续校准脚本直接对齐：
@@ -374,12 +374,12 @@ else:
 - `track_is_locked/student_id/quality/similarity`：可选字段，用于过滤与误差分析
 
 #### 3.5.2 细标签→粗标签映射与可比较性
-为使人工标注与 CLIP 输出的粗标签空间可比较，脚本内置默认映射（见 [calibrate_from_annotations.py:L87-L98](scripts/calibrate_from_annotations.py#L87-L98)）：
+为使人工标注与 CLIP 输出的粗标签空间可比较，脚本内置默认映射（见 [calibrate_from_annotations.py:L87-L98](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/scripts/calibrate_from_annotations.py#L87-L98)）：
 
 `listening_upright→listening`，`on_task_head_down→reading_or_writing`，`off_task→distracted`，`using_device→using_device` 等。该映射将“课堂业务细标签”统一到模型可输出的“粗标签集合”，使得混淆矩阵与宏 F1 等指标可解释。
 
 #### 3.5.3 校准脚本：heuristic vs clip 两种评估模式
-项目提供校准脚本 [calibrate_from_annotations.py](scripts/calibrate_from_annotations.py)：
+项目提供校准脚本 [calibrate_from_annotations.py](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/scripts/calibrate_from_annotations.py)：
 
 - `mode=heuristic`：比较 `target_label` 与 `annotator_label` 的差异，评估“当前规则/策略”在标注集上的一致性  
 - `mode=clip`：在给定 `video_path + frame + crop_bbox_xyxy` 的条件下重跑 CLIP 推理，得到 coarse 预测并与人工 coarse 对比  
@@ -387,8 +387,8 @@ else:
 
 其核心实现包括：
 
-1) 读取 JSONL、过滤样本并累积混淆矩阵（见 [calibrate_from_annotations.py:L165-L191](scripts/calibrate_from_annotations.py#L165-L191)）  
-2) 在 clip 模式下对每个样本采样动作片段、裁剪并推理（见 [calibrate_from_annotations.py:L110-L137](scripts/calibrate_from_annotations.py#L110-L137)）
+1) 读取 JSONL、过滤样本并累积混淆矩阵（见 [calibrate_from_annotations.py:L165-L191](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/scripts/calibrate_from_annotations.py#L165-L191)）  
+2) 在 clip 模式下对每个样本采样动作片段、裁剪并推理（见 [calibrate_from_annotations.py:L110-L137](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/scripts/calibrate_from_annotations.py#L110-L137)）
 
 ```python
 def _predict_clip_coarse(model, cap, *, frame, crop_bbox_xyxy, fps, max_frame, clip_seconds, num_frames):
@@ -403,8 +403,8 @@ def _predict_clip_coarse(model, cap, *, frame, crop_bbox_xyxy, fps, max_frame, c
 #### 3.5.4 参数搜索与门控阈值优化（证据：calibration_search_report）
 除“提示词迭代”外，本项目还对 `temperature`、`smooth_alpha`、`uncertain_min_prob/margin`、`distracted_enter/stay` 等参数进行搜索，并输出可复现的搜索报告：
 
-- `outputs/calibration_report.json`：给定参数下的混淆矩阵、top1 概率与 margin 分布统计（例如 n=15、accuracy=0.533 的小样本校准；见 [calibration_report.json](outputs/calibration_report.json#L1-L87)）  
-- `outputs/calibration_search_report.json`：给定目标函数下的 top-k 参数组合（见 [calibration_search_report.json](outputs/calibration_search_report.json#L1-L35)）
+- `outputs/calibration_report.json`：给定参数下的混淆矩阵、top1 概率与 margin 分布统计（例如 n=15、accuracy=0.533 的小样本校准；见 `calibration_report.json`）  
+- `outputs/calibration_search_report.json`：给定目标函数下的 top-k 参数组合（见 `calibration_search_report.json`）
 
 该部分工作使得“CLIP 优化”从经验调参转向“以标注集为依据的可量化迭代”，与 3.2.3 的检测器微调共同构成“数据驱动的端到端提升”路径：检测器提升裁剪可观测性，校准脚本提升提示词与门控策略的可解释可复现性。
 
@@ -422,10 +422,10 @@ def _predict_clip_coarse(model, cap, *, frame, crop_bbox_xyxy, fps, max_frame, c
 
 ## 5 实验与结果
 ### 5.1 CLIP vs Kinetics：类别空间与课堂语义贴合性
-项目在 [CLIP_vs_Kinetics_comparison.md](outputs/CLIP_vs_Kinetics_comparison.md) 中给出 CLIP 与 Kinetics 的对比实验：在同一段 15 秒视频上，CLIP（ViT-B/32, subsample=4）耗时 245.78s，Kinetics（r3d_18）耗时 394.06s，CLIP 在该配置下更快约 60%。更关键的是，CLIP 的预测类别由提示语定义，天然受课堂语义约束，而 Kinetics 的固定类别空间更易出现语义不贴合行为，解释性较差。
+项目在 `CLIP_vs_Kinetics_comparison.md` 中给出 CLIP 与 Kinetics 的对比实验：在同一段 15 秒视频上，CLIP（ViT-B/32, subsample=4）耗时 245.78s，Kinetics（r3d_18）耗时 394.06s，CLIP 在该配置下更快约 60%。更关键的是，CLIP 的预测类别由提示语定义，天然受课堂语义约束，而 Kinetics 的固定类别空间更易出现语义不贴合行为，解释性较差。
 
 ### 5.2 标注驱动的校准报告：混淆对与不确定性分布
-本项目保留了校准报告 [calibration_report.json](outputs/calibration_report.json) 作为“标注→评估→迭代”的证据。该报告在 n=15 的样本上得到 accuracy=0.533（8/15），并给出混淆矩阵与不确定性分布（top1_prob 与 margin 的分位数）。从混淆矩阵可见，主要错误集中在 `listening` 与 `reading_or_writing` 的边界（`listening` 被预测为 `reading_or_writing` 计 4 次），这与课堂中“抬头听讲 vs 低头读写”的视觉差异在低分辨率下易混淆相一致。
+本项目保留了校准报告 `calibration_report.json` 作为“标注→评估→迭代”的证据。该报告在 n=15 的样本上得到 accuracy=0.533（8/15），并给出混淆矩阵与不确定性分布（top1_prob 与 margin 的分位数）。从混淆矩阵可见，主要错误集中在 `listening` 与 `reading_or_writing` 的边界（`listening` 被预测为 `reading_or_writing` 计 4 次），这与课堂中“抬头听讲 vs 低头读写”的视觉差异在低分辨率下易混淆相一致。
 
 为了将该观察转化为可操作的优化路径，本项目把错误归因拆解为两类可验证假设：
 
@@ -433,7 +433,7 @@ def _predict_clip_coarse(model, cap, *, frame, crop_bbox_xyxy, fps, max_frame, c
 2) 在裁剪框可观测的前提下，是否需要通过提示词与门控阈值把“边界样本”压回更保守标签（见 3.5）
 
 ### 5.3 参数搜索报告：门控/平滑阈值的目标函数优化
-除单点评估外，本项目还对门控与平滑参数进行了搜索，并输出 [calibration_search_report.json](outputs/calibration_search_report.json)。该报告定义目标函数：
+除单点评估外，本项目还对门控与平滑参数进行了搜索，并输出 `calibration_search_report.json`。该报告定义目标函数：
 
 ```text
 score = accuracy + 0.5*listening_recall + 0.3*distracted_recall
@@ -442,44 +442,41 @@ score = accuracy + 0.5*listening_recall + 0.3*distracted_recall
 并给出 best/top-k 参数组合（例如 `temperature=40.0, smooth_alpha=0.8, distracted_enter_min_margin=0.25` 等）。该结果体现了本项目的研究取向：不是单纯追求 overall accuracy，而是把“课堂最关键行为（如听讲/分心）”的召回纳入优化目标，从而与教学应用需求对齐。
 
 ### 5.4 身体框微调的验证思路：从“可观测性”到“using_device”改进
-本项目提供了 YOLO “学生上下文框（student_context）”微调方案（见 3.2.3），其预期收益并非直接提升检测 mAP 本身，而是提升“行为识别输入的可观测性”：让裁剪片段更稳定地包含桌面与设备，从而减少 `using_device` 被误判为 `reading_or_writing` 的情况。验证方式建议采用“同一 Face JSON + 同一视频 + 不同 person_detector_weights”做对照试验，比较 `using_device` 的召回、以及 `listening`/`reading_or_writing` 的混淆是否下降（见 [YOLO_finetune_for_context.md](docs/YOLO_finetune_for_context.md#L56-L69) 的评估建议）。
+本项目提供了 YOLO “学生上下文框（student_context）”微调方案（见 3.2.3），其预期收益并非直接提升检测 mAP 本身，而是提升“行为识别输入的可观测性”：让裁剪片段更稳定地包含桌面与设备，从而减少 `using_device` 被误判为 `reading_or_writing` 的情况。验证方式建议采用“同一 Face JSON + 同一视频 + 不同 person_detector_weights”做对照试验，比较 `using_device` 的召回、以及 `listening`/`reading_or_writing` 的混淆是否下降（见 [YOLO_finetune_for_context.md](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/docs/YOLO_finetune_for_context.md#L56-L69) 的评估建议）。
 
-此外，系统输出的多模态证据包括测试快照：
-
-![人脸识别示例帧（测试快照）](outputs/pytest_face_recognition_20251115_clip_frame.jpg)
-
-### 5.5 最终行为识别结果展示（前端截图占位 + 文字说明）
+### 5.5 最终行为识别结果展示
 本节将“最终展示物”按论文常见图表规范组织为两部分：图片展示与文字说明。图片为前端页面截图（此处先以相对路径占位，后续可用真实截图替换）。
 
-#### 5.5.1 图片展示（截图占位）
+#### 5.5.1 图片展示
 - 图 5-1 班级总览页：学生列表、总体行为占比、关键片段入口  
-  ![班级总览页（占位，后续替换截图）](fronts/assets/screenshots/overview.png)
+  ![班级总览页](https://github.com/James-Leong/classroom-behavior-analysis/raw/main/fronts/public/data/screenshots/overview.png)
 
 - 图 5-2 学生详情页：行为时间线、分段列表、点击跳转到视频时间点  
-  ![学生详情页（占位，后续替换截图）](fronts/assets/screenshots/student_detail.png)
+  ![学生详情页](https://github.com/James-Leong/classroom-behavior-analysis/raw/main/fronts/public/data/screenshots/student_detail.png)
 
-- 图 5-3 叠加回放页：视频帧叠加人脸/身体框与身份标识（用于证据链复核）  
-  ![叠加回放页（占位，后续替换截图）](fronts/assets/screenshots/overlay_playback.png)
+- 图 5-3 学生详情页的实时推理面板（EMA）：展示 EMA 平滑后的各行为概率（用于解释最终标签与门控/平滑效果）  
+  ![EMA 实时推理面板（EMA）](https://github.com/James-Leong/classroom-behavior-analysis/raw/main/fronts/public/data/screenshots/ema_table.png)
 
-#### 5.5.2 文字说明（与截图一一对应）
-为保证“可解释性 + 可复现性”，每张截图建议配套给出以下文字说明要素（可直接作为论文图注/正文段落模板）：
+#### 5.5.2 结果分析
+结合图 5-1～图 5-3，可以将本系统的“最终结果”理解为一条从总体统计到单人证据的可追溯链路。
 
-1) **数据来源**：视频文件名、对应输出文件（Face JSON 与 Behavior JSON）、采样间隔（`sample_dt_seconds`）  
-2) **主体一致性说明**：选定学生在该片段内 `track_is_locked` 的状态变化（若有解锁/切换，说明原因与影响）  
-3) **裁剪证据**：该片段使用的裁剪框来源（`body_bbox` / person detector / face fallback），以及其对关键上下文（桌面/双手/设备）的覆盖情况  
-4) **行为判定证据**：top1/top2、top1_prob、margin、不确定性门控是否触发、平滑前后差异（说明最终标签为何合理）  
-5) **最终输出**：该行为段的起止时间（或帧号）、持续时长、在“学生总观察时长”中的占比（对应 `behavior_stats.json` 的 segments/ratio）
+图 5-1（班级总览）用于回答“全班层面发生了什么”：左侧为学生列表（可切换到单个学生视角），主体区域以堆叠条形图汇总各学生在不同标签下的累计时长，从而快速定位异常模式（例如个别学生 `distracted/using_device` 占比显著更高）。
+
+图 5-2（学生详情页）用于回答“该学生在时间轴上何时发生了什么”：页面以视频回放为主体，并配合行为时间线展示分段结果；用户可通过时间线/分段定位到具体时间点，并在视频回放中对照课堂语境完成复核。
+
+图 5-3（实时推理面板 EMA）用于回答“为什么最终标签是这个”：面板展示每一类行为的 EMA 平滑分数（按分数排序并以百分比条形显示），直观反映模型在当前时刻对各标签的相对置信度；当出现短时抖动或边界样本时，EMA 的平滑效果使得“最终展示标签”更稳定，便于与门控策略一起解释最终输出。
 
 ---
 
 ## 6 讨论与局限
-1) 身份切换检测路径中存在“需要分割但暂未实现”的逻辑（见 [recognizer.py:L373-L377](../src/video/recognizer.py#L373-L377)）。后续可实现轨迹分割以形成更严格的主体一致性约束。  
-2) CLIP 零样本无需训练，但对提示语与裁剪框质量敏感。建议采用标注驱动的校准流程（见 [CLIP_USAGE.md](CLIP_USAGE.md)）。  
+1) 身份切换检测路径中存在“需要分割但暂未实现”的逻辑（见 [recognizer.py:L373-L377](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/src/video/recognizer.py#L373-L377)）。后续可实现轨迹分割以形成更严格的主体一致性约束。  
+2) CLIP 零样本无需训练，但对提示语与裁剪框质量敏感。建议采用标注驱动的校准流程（见 [CLIP_USAGE.md](https://github.com/James-Leong/classroom-behavior-analysis/blob/main/docs/CLIP_USAGE.md)）。  
 3) 课堂视频与人脸属于敏感数据，真实部署需遵循授权、最小化存储、访问控制与审计机制。
 ---
 
 ## 7 结论
 本研究实现了一套面向课堂场景的端到端行为分析系统，并在检测、跟踪、身份稳定、行为识别与可视化数据工程多个层面给出可复现的优化方案。两阶段解耦保证身份策略与行为模型可独立迭代；body-only 回退提升遮挡/低头场景轨迹连续性；滞回锁定降低身份抖动；CLIP 零样本与批量推理优化提升语义贴合与吞吐；前端分块加载将小时级结果转化为可交互、可解释的分析界面。
+
 ---
 
 ## 参考文献
