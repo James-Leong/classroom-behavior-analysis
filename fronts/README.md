@@ -142,6 +142,29 @@ fronts/
 └── scripts/            # 辅助脚本 (如数据分割脚本)
 ```
 
-## 📝 许可证
+## � 研究报告（前端实现与数据流程）
+
+```mermaid
+flowchart LR
+    M[manifest + chunks<br/>data/outputs/face_manifest.json] --> L[useAppStore 加载器]
+    L --> V[VideoPlayer<br/>叠加人脸/身份/锁定状态]
+    L --> T[Timeline<br/>学生行为分段]
+    L --> D[DebugPanel<br/>EMA 评分与门控]
+    B[behavior_finetuned.json] --> L
+    Vid[video/20251115_1h.mp4] --> V
+```
+
+- 分块加载：根据当前时间定位 chunk，按需请求并合并到状态，避免一次性加载大 JSON。[useAppStore](file:///mnt/l/project/classroom-behavior-analysis/fronts/src/store/useAppStore.ts#L86-L106)
+- 视频渲染：以 `video.currentTime` 推算帧索引，向前回溯查找最近帧，绘制人脸框并支持学生筛选。[VideoPlayer](file:///mnt/l/project/classroom-behavior-analysis/fronts/src/components/VideoPlayer.tsx#L134-L175)
+- 时间线：聚合选定学生的各类行为段并渲染彩色分段，支持标签映射与提示。[Timeline](file:///mnt/l/project/classroom-behavior-analysis/fronts/src/components/Timeline.tsx#L1-L37)
+- 调试面板：从 debug trace 中检索离当前时间最近的一条记录，显示 EMA 分数排行与门控状态。[DebugPanel](file:///mnt/l/project/classroom-behavior-analysis/fronts/src/components/DebugPanel.tsx#L1-L40)
+
+数据放置约定（用于静态站点）：
+- `data/video/20251115_1h.mp4` 原始视频
+- `data/outputs/face_manifest.json` + `data/outputs/face_chunk_*.json` 人脸识别结果分块
+- `data/outputs/behavior_finetuned.json` 行为统计结果
+- `data/outputs/debug_trace.json` 可选调试数据
+
+## �📝 许可证
 
 本项目是课堂行为分析系统的一部分。
