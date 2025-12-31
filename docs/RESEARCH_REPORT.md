@@ -1,8 +1,10 @@
 # 课堂行为分析系统研究报告
 
 **题目**：课堂行为分析系统：两阶段人脸—轨迹—零样本行为识别流水线与可解释可视化实现  
-**作者**：Classroom Behavior Analysis 项目组  
+**作者**：[James Leong](https://github.com/James-Leong) 
 **日期**：2025-12-31  
+**前端演示**：[课堂行为分析系统前端演示](https://james-leong.github.io/classroom-behavior-analysis/)  
+**代码仓库**：[James-Leong/classroom-behavior-analysis](https://github.com/James-Leong/classroom-behavior-analysis)  
 
 ---
 
